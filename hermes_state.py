@@ -21,6 +21,7 @@ import re
 import sqlite3
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, TypeVar
@@ -31,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    summary TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -111,6 +113,30 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
 END;
 """
 
+# Trigram FTS5 table for substring matching (e.g., "ussy" will match "becomussy")
+# Uses the trigram tokenizer which breaks text into 3-character chunks
+TRIGRAM_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
+    content,
+    content=messages,
+    content_rowid=id,
+    tokenize="trigram"
+);
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts_trigram(rowid, content) VALUES (new.id, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content) VALUES('delete', old.id, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content) VALUES('delete', old.id, old.content);
+    INSERT INTO messages_fts_trigram(rowid, content) VALUES (new.id, new.content);
+END;
+"""
+
 
 class SessionDB:
     """
@@ -130,8 +156,8 @@ class SessionDB:
     # application level with random jitter, which naturally staggers competing
     # writers and avoids the convoy.
     _WRITE_MAX_RETRIES = 15
-    _WRITE_RETRY_MIN_S = 0.020   # 20ms
-    _WRITE_RETRY_MAX_S = 0.150   # 150ms
+    _WRITE_RETRY_MIN_S = 0.020  # 20ms
+    _WRITE_RETRY_MAX_S = 0.150  # 150ms
     # Attempt a PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 50
 
@@ -223,13 +249,12 @@ class SessionDB:
         """
         try:
             with self._lock:
-                result = self._conn.execute(
-                    "PRAGMA wal_checkpoint(PASSIVE)"
-                ).fetchone()
+                result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                 if result and result[1] > 0:
                     logger.debug(
                         "WAL checkpoint: %d/%d pages checkpointed",
-                        result[2], result[1],
+                        result[2],
+                        result[1],
                     )
         except Exception:
             pass  # Best effort — never fatal.
@@ -259,7 +284,9 @@ class SessionDB:
         cursor.execute("SELECT version FROM schema_version LIMIT 1")
         row = cursor.fetchone()
         if row is None:
-            cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+            cursor.execute(
+                "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
+            )
         else:
             current_version = row["version"] if isinstance(row, sqlite3.Row) else row[0]
             if current_version < 2:
@@ -306,7 +333,9 @@ class SessionDB:
                         # not user input. Double-quote identifier escaping is applied
                         # as defense-in-depth; SQLite DDL cannot be parameterized.
                         safe_name = name.replace('"', '""')
-                        cursor.execute(f'ALTER TABLE sessions ADD COLUMN "{safe_name}" {column_type}')
+                        cursor.execute(
+                            f'ALTER TABLE sessions ADD COLUMN "{safe_name}" {column_type}'
+                        )
                     except sqlite3.OperationalError:
                         pass
                 cursor.execute("UPDATE schema_version SET version = 5")
@@ -329,6 +358,26 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: add trigram FTS5 table for substring matching
+                # This enables searches like "ussy" to match "becomussy"
+                try:
+                    cursor.executescript(TRIGRAM_FTS_SQL)
+                    # Populate the trigram index with existing messages
+                    cursor.execute("""
+                        INSERT INTO messages_fts_trigram(rowid, content)
+                        SELECT id, content FROM messages WHERE content IS NOT NULL
+                    """)
+                    logger.info("Trigram FTS5 index created and populated")
+                except sqlite3.OperationalError as e:
+                    logger.warning(f"Failed to create trigram FTS5 index: {e}")
+                cursor.execute("UPDATE schema_version SET version = 7")
+            if current_version < 8:
+                try:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN summary TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                cursor.execute("UPDATE schema_version SET version = 8")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -345,6 +394,12 @@ class SessionDB:
             cursor.execute("SELECT * FROM messages_fts LIMIT 0")
         except sqlite3.OperationalError:
             cursor.executescript(FTS_SQL)
+
+        # Trigram FTS5 setup for substring matching
+        try:
+            cursor.execute("SELECT * FROM messages_fts_trigram LIMIT 0")
+        except sqlite3.OperationalError:
+            cursor.executescript(TRIGRAM_FTS_SQL)
 
         self._conn.commit()
 
@@ -363,6 +418,7 @@ class SessionDB:
         parent_session_id: str = None,
     ) -> str:
         """Create a new session record. Returns the session_id."""
+
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
@@ -379,34 +435,41 @@ class SessionDB:
                     time.time(),
                 ),
             )
+
         self._execute_write(_do)
         return session_id
 
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended."""
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ?",
                 (time.time(), end_reason, session_id),
             )
+
         self._execute_write(_do)
 
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
                 (session_id,),
             )
+
         self._execute_write(_do)
 
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET system_prompt = ? WHERE id = ?",
                 (system_prompt, session_id),
             )
+
         self._execute_write(_do)
 
     def update_token_counts(
@@ -495,8 +558,10 @@ class SessionDB:
             model,
             session_id,
         )
+
         def _do(conn):
             conn.execute(sql, params)
+
         self._execute_write(_do)
 
     def ensure_session(
@@ -511,6 +576,7 @@ class SessionDB:
         create_session() call (e.g. transient SQLite lock at agent startup).
         INSERT OR IGNORE is safe to call even when the row already exists.
         """
+
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions
@@ -518,6 +584,7 @@ class SessionDB:
                    VALUES (?, ?, ?, ?)""",
                 (session_id, source, model, time.time()),
             )
+
         self._execute_write(_do)
 
     def set_token_counts(
@@ -544,6 +611,7 @@ class SessionDB:
         conversation run (e.g. the gateway, where the cached agent's
         session_prompt_tokens already reflects the running total).
         """
+
         def _do(conn):
             conn.execute(
                 """UPDATE sessions SET
@@ -584,6 +652,7 @@ class SessionDB:
                     session_id,
                 ),
             )
+
         self._execute_write(_do)
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -607,8 +676,7 @@ class SessionDB:
             return exact["id"]
 
         escaped = (
-            session_id_or_prefix
-            .replace("\\", "\\\\")
+            session_id_or_prefix.replace("\\", "\\\\")
             .replace("%", "\\%")
             .replace("_", "\\_")
         )
@@ -645,19 +713,20 @@ class SessionDB:
         # Remove ASCII control characters (0x00-0x1F, 0x7F) but keep
         # whitespace chars (\t=0x09, \n=0x0A, \r=0x0D) so they can be
         # normalized to spaces by the whitespace collapsing step below
-        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', title)
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", title)
 
         # Remove problematic Unicode control characters:
         # - Zero-width chars (U+200B-U+200F, U+FEFF)
         # - Directional overrides (U+202A-U+202E, U+2066-U+2069)
         # - Object replacement (U+FFFC), interlinear annotation (U+FFF9-U+FFFB)
         cleaned = re.sub(
-            r'[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]',
-            '', cleaned,
+            r"[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]",
+            "",
+            cleaned,
         )
 
         # Collapse internal whitespace runs and strip
-        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
         if not cleaned:
             return None
@@ -678,6 +747,7 @@ class SessionDB:
         Empty/whitespace-only strings are normalized to None (clearing the title).
         """
         title = self.sanitize_title(title)
+
         def _do(conn):
             if title:
                 # Check uniqueness (allow the same session to keep its own title)
@@ -695,6 +765,7 @@ class SessionDB:
                 (title, session_id),
             )
             return cursor.rowcount
+
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
@@ -706,6 +777,34 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return row["title"] if row else None
+
+    def set_session_summary(self, session_id: str, summary: Optional[str]) -> bool:
+        cleaned = None
+        if isinstance(summary, str):
+            cleaned = " ".join(summary.split()).strip() or None
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET summary = ? WHERE id = ?",
+                (cleaned, session_id),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do) > 0
+
+    def list_sessions_missing_summary(
+        self, limit: int = 50, include_existing: bool = False
+    ) -> List[Dict[str, Any]]:
+        where_sql = "WHERE message_count > 0"
+        if not include_existing:
+            where_sql += " AND ((summary IS NULL OR TRIM(summary) = '') OR (title IS NULL OR TRIM(title) = ''))"
+        with self._lock:
+            cursor = self._conn.execute(
+                f"SELECT id, title, source, model, summary, message_count FROM sessions {where_sql} ORDER BY started_at DESC LIMIT ?",
+                (limit,),
+            )
+            rows = cursor.fetchall()
+        return [dict(row) for row in rows]
 
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
@@ -752,7 +851,7 @@ class SessionDB:
         the highest existing number and increments.
         """
         # Strip existing #N suffix to find the true base
-        match = re.match(r'^(.*?) #(\d+)$', base_title)
+        match = re.match(r"^(.*?) #(\d+)$", base_title)
         if match:
             base = match.group(1)
         else:
@@ -774,7 +873,7 @@ class SessionDB:
         # Find the highest number
         max_num = 1  # The unnumbered original counts as #1
         for t in existing:
-            m = re.match(r'^.* #(\d+)$', t)
+            m = re.match(r"^.* #(\d+)$", t)
             if m:
                 max_num = max(max_num, int(m.group(1)))
 
@@ -790,7 +889,7 @@ class SessionDB:
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
-        Returns dicts with keys: id, source, model, title, started_at, ended_at,
+        Returns dicts with keys: id, source, model, title, summary, started_at, ended_at,
         message_count, preview (first 60 chars of first user message),
         last_active (timestamp of last message).
 
@@ -876,12 +975,10 @@ class SessionDB:
         """
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
-            json.dumps(reasoning_details)
-            if reasoning_details else None
+            json.dumps(reasoning_details) if reasoning_details else None
         )
         codex_items_json = (
-            json.dumps(codex_reasoning_items)
-            if codex_reasoning_items else None
+            json.dumps(codex_reasoning_items) if codex_reasoning_items else None
         )
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
 
@@ -986,7 +1083,9 @@ class SessionDB:
                         pass
                 if row["codex_reasoning_items"]:
                     try:
-                        msg["codex_reasoning_items"] = json.loads(row["codex_reasoning_items"])
+                        msg["codex_reasoning_items"] = json.loads(
+                            row["codex_reasoning_items"]
+                        )
                     except (json.JSONDecodeError, TypeError):
                         pass
             messages.append(msg)
@@ -1023,7 +1122,7 @@ class SessionDB:
         sanitized = re.sub(r'"[^"]*"', _preserve_quoted, query)
 
         # Step 2: Strip remaining (unmatched) FTS5-special characters
-        sanitized = re.sub(r'[+{}()\"^]', " ", sanitized)
+        sanitized = re.sub(r"[+{}()\"^]", " ", sanitized)
 
         # Step 3: Collapse repeated * (e.g. "***") into a single one,
         # and remove leading * (prefix-only needs at least one char before *)
@@ -1150,6 +1249,320 @@ class SessionDB:
         for match in matches:
             match.pop("content", None)
 
+        # FTS5 can't match substrings (e.g., "ussy" won't match "becomussy")
+        # Try trigram FTS5 for substring matching, then LIKE as final fallback
+        if not matches:
+            matches = self._search_messages_trigram(
+                query, source_filter, exclude_sources, role_filter, limit, offset
+            )
+            if not matches:
+                matches = self._search_messages_like(
+                    query, source_filter, exclude_sources, role_filter, limit, offset
+                )
+
+        session_meta_matches = self._search_session_metadata(
+            query, source_filter, exclude_sources, role_filter, limit, offset
+        )
+        if session_meta_matches:
+            seen = {(m["session_id"], m.get("id"), m.get("snippet")) for m in matches}
+            for match in session_meta_matches:
+                key = (match["session_id"], match.get("id"), match.get("snippet"))
+                if key not in seen:
+                    matches.append(match)
+                    seen.add(key)
+            matches = matches[:limit]
+
+        return matches
+
+    def _search_session_metadata(
+        self,
+        query: str,
+        source_filter: List[str] = None,
+        exclude_sources: List[str] = None,
+        role_filter: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        if not query or not query.strip():
+            return []
+
+        like_pattern = (
+            query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        like_pattern = f"%{like_pattern}%"
+
+        where_clauses = [
+            "((s.title IS NOT NULL AND s.title LIKE ? ESCAPE '\\') OR (s.summary IS NOT NULL AND s.summary LIKE ? ESCAPE '\\'))"
+        ]
+        params: list = [like_pattern, like_pattern]
+
+        if source_filter is not None:
+            source_placeholders = ",".join("?" for _ in source_filter)
+            where_clauses.append(f"s.source IN ({source_placeholders})")
+            params.extend(source_filter)
+
+        if exclude_sources is not None:
+            exclude_placeholders = ",".join("?" for _ in exclude_sources)
+            where_clauses.append(f"s.source NOT IN ({exclude_placeholders})")
+            params.extend(exclude_sources)
+
+        where_sql = " AND ".join(where_clauses)
+        params.extend([limit, offset])
+
+        sql = f"""
+            SELECT
+                COALESCE(
+                    (SELECT id FROM messages WHERE session_id = s.id ORDER BY timestamp DESC, id DESC LIMIT 1),
+                    0
+                ) AS id,
+                s.id AS session_id,
+                'session' AS role,
+                COALESCE(s.summary, s.title, '') AS content,
+                s.started_at AS timestamp,
+                NULL AS tool_name,
+                s.source,
+                s.model,
+                s.started_at AS session_started,
+                CASE
+                    WHEN s.title IS NOT NULL AND s.title LIKE ? ESCAPE '\\' THEN s.title
+                    ELSE COALESCE(s.summary, s.title, '')
+                END AS snippet
+            FROM sessions s
+            WHERE {where_sql}
+            ORDER BY s.started_at DESC
+            LIMIT ? OFFSET ?
+        """
+
+        metadata_params = [like_pattern] + params
+
+        with self._lock:
+            cursor = self._conn.execute(sql, metadata_params)
+            matches = [dict(row) for row in cursor.fetchall()]
+
+        for match in matches:
+            match["context"] = []
+            match.pop("content", None)
+
+        return matches
+
+    def _search_messages_trigram(
+        self,
+        query: str,
+        source_filter: List[str] = None,
+        exclude_sources: List[str] = None,
+        role_filter: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Trigram FTS5 search for substring matching.
+
+        The trigram tokenizer breaks text into 3-character chunks, enabling
+        true substring matching. Use this when regular FTS5 (word-based)
+        returns no results.
+        """
+        if not query or not query.strip():
+            return []
+
+        # Sanitize query for trigram search (simpler than word-based FTS5)
+        # Trigram FTS5 is more forgiving but still needs escaping
+        trigram_query = query.strip()
+        # Escape FTS5 special characters
+        trigram_query = re.sub(r"[+{}()^]", " ", trigram_query)
+        # Remove leading/trailing wildcards
+        trigram_query = re.sub(r"\*+", "", trigram_query).strip()
+        if not trigram_query:
+            return []
+
+        # Check if trigram table exists
+        with self._lock:
+            try:
+                self._conn.execute("SELECT * FROM messages_fts_trigram LIMIT 0")
+            except sqlite3.OperationalError:
+                return []  # Trigram table doesn't exist yet
+
+        # Build WHERE clauses dynamically
+        where_clauses = ["messages_fts_trigram MATCH ?"]
+        params: list = [trigram_query]
+
+        if source_filter is not None:
+            source_placeholders = ",".join("?" for _ in source_filter)
+            where_clauses.append(f"s.source IN ({source_placeholders})")
+            params.extend(source_filter)
+
+        if exclude_sources is not None:
+            exclude_placeholders = ",".join("?" for _ in exclude_sources)
+            where_clauses.append(f"s.source NOT IN ({exclude_placeholders})")
+            params.extend(exclude_sources)
+
+        if role_filter:
+            role_placeholders = ",".join("?" for _ in role_filter)
+            where_clauses.append(f"m.role IN ({role_placeholders})")
+            params.extend(role_filter)
+
+        where_sql = " AND ".join(where_clauses)
+        params.extend([limit, offset])
+
+        sql = f"""
+            SELECT
+                m.id,
+                m.session_id,
+                m.role,
+                snippet(messages_fts_trigram, 0, '>>>', '<<<', '...', 40) AS snippet,
+                m.content,
+                m.timestamp,
+                m.tool_name,
+                s.source,
+                s.model,
+                s.started_at AS session_started
+            FROM messages_fts_trigram
+            JOIN messages m ON m.id = messages_fts_trigram.rowid
+            JOIN sessions s ON s.id = m.session_id
+            WHERE {where_sql}
+            ORDER BY rank
+            LIMIT ? OFFSET ?
+        """
+
+        with self._lock:
+            try:
+                cursor = self._conn.execute(sql, params)
+            except sqlite3.OperationalError:
+                return []
+            matches = [dict(row) for row in cursor.fetchall()]
+
+        # Add surrounding context (same as regular FTS5 search)
+        for match in matches:
+            try:
+                with self._lock:
+                    ctx_cursor = self._conn.execute(
+                        """SELECT role, content FROM messages
+                           WHERE session_id = ? AND id >= ? - 1 AND id <= ? + 1
+                           ORDER BY id""",
+                        (match["session_id"], match["id"], match["id"]),
+                    )
+                    context_msgs = [
+                        {"role": r["role"], "content": (r["content"] or "")[:200]}
+                        for r in ctx_cursor.fetchall()
+                    ]
+                match["context"] = context_msgs
+            except Exception:
+                match["context"] = []
+
+        # Remove full content from result
+        for match in matches:
+            match.pop("content", None)
+
+        return matches
+
+    def _search_messages_like(
+        self,
+        query: str,
+        source_filter: List[str] = None,
+        exclude_sources: List[str] = None,
+        role_filter: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        LIKE-based fallback for substring matching when FTS5 fails.
+
+        FTS5 only matches whole tokens, so queries like "ussy" won't find
+        "becomussy" or "battlebussy". This method uses LIKE for true
+        substring matching at the cost of slower performance.
+        """
+        if not query or not query.strip():
+            return []
+
+        # Escape SQL LIKE wildcards and build the pattern
+        like_pattern = (
+            query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        like_pattern = f"%{like_pattern}%"
+
+        # Build WHERE clauses dynamically
+        where_clauses = ["m.content LIKE ? ESCAPE '\\'"]
+        params: list = [like_pattern]
+
+        if source_filter is not None:
+            source_placeholders = ",".join("?" for _ in source_filter)
+            where_clauses.append(f"s.source IN ({source_placeholders})")
+            params.extend(source_filter)
+
+        if exclude_sources is not None:
+            exclude_placeholders = ",".join("?" for _ in exclude_sources)
+            where_clauses.append(f"s.source NOT IN ({exclude_placeholders})")
+            params.extend(exclude_sources)
+
+        if role_filter:
+            role_placeholders = ",".join("?" for _ in role_filter)
+            where_clauses.append(f"m.role IN ({role_placeholders})")
+            params.extend(role_filter)
+
+        where_sql = " AND ".join(where_clauses)
+        params.extend([limit, offset])
+
+        sql = f"""
+            SELECT
+                m.id,
+                m.session_id,
+                m.role,
+                m.content,
+                m.timestamp,
+                m.tool_name,
+                s.source,
+                s.model,
+                s.started_at AS session_started
+            FROM messages m
+            JOIN sessions s ON s.id = m.session_id
+            WHERE {where_sql}
+            ORDER BY m.timestamp DESC
+            LIMIT ? OFFSET ?
+        """
+
+        with self._lock:
+            cursor = self._conn.execute(sql, params)
+            matches = [dict(row) for row in cursor.fetchall()]
+
+        # Build snippets manually (highlight the match)
+        for match in matches:
+            content = match.get("content", "") or ""
+            # Find the match position and build a snippet around it
+            query_lower = query.strip().lower()
+            content_lower = content.lower()
+            pos = content_lower.find(query_lower)
+            if pos != -1:
+                # Show ~40 chars before and after the match
+                start = max(0, pos - 40)
+                end = min(len(content), pos + len(query) + 40)
+                snippet = content[start:end]
+                if start > 0:
+                    snippet = "..." + snippet
+                if end < len(content):
+                    snippet = snippet + "..."
+                match["snippet"] = snippet
+            else:
+                match["snippet"] = content[:80] + ("..." if len(content) > 80 else "")
+            # Remove full content
+            match.pop("content", None)
+
+        # Add surrounding context (same as FTS5 search)
+        for match in matches:
+            try:
+                with self._lock:
+                    ctx_cursor = self._conn.execute(
+                        """SELECT role, content FROM messages
+                           WHERE session_id = ? AND id >= ? - 1 AND id <= ? + 1
+                           ORDER BY id""",
+                        (match["session_id"], match["id"], match["id"]),
+                    )
+                    context_msgs = [
+                        {"role": r["role"], "content": (r["content"] or "")[:200]}
+                        for r in ctx_cursor.fetchall()
+                    ]
+                match["context"] = context_msgs
+            except Exception:
+                match["context"] = []
+
         return matches
 
     def search_sessions(
@@ -1222,16 +1635,178 @@ class SessionDB:
             results.append({**session, "messages": messages})
         return results
 
-    def clear_messages(self, session_id: str) -> None:
-        """Delete all messages for a session and reset its counters."""
+    @staticmethod
+    def _parse_session_timestamp(value: Any) -> float:
+        if value is None:
+            return time.time()
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return time.time()
+            try:
+                return float(raw)
+            except ValueError:
+                pass
+            try:
+                return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return time.time()
+        return time.time()
+
+    def import_session_dump(self, data: Dict[str, Any]) -> Optional[str]:
+        """Import a legacy JSON session dump into SQLite if missing.
+
+        The importer is intentionally conservative: existing sessions are left
+        untouched, and only the common transcript fields are mapped.
+        """
+        session_id = str(data.get("session_id") or data.get("id") or "").strip()
+        if not session_id:
+            return None
+
+        if self.get_session(session_id):
+            return session_id
+
+        source = (
+            str(data.get("source") or data.get("platform") or "cli").strip() or "cli"
+        )
+        model = str(data.get("model") or "").strip() or None
+        system_prompt = (
+            data.get("system_prompt")
+            if isinstance(data.get("system_prompt"), str)
+            else None
+        )
+        started_at = self._parse_session_timestamp(
+            data.get("session_start") or data.get("started_at")
+        )
+        ended_at = self._parse_session_timestamp(
+            data.get("last_updated") or data.get("ended_at")
+        )
+        base_url = str(data.get("base_url") or "").strip() or None
+        provider = str(data.get("provider") or "").strip() or None
+        messages = (
+            data.get("messages") if isinstance(data.get("messages"), list) else []
+        )
+
+        serialized_messages = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            serialized_messages.append(
+                {
+                    "role": str(msg.get("role") or "assistant"),
+                    "content": msg.get("content"),
+                    "tool_name": msg.get("tool_name"),
+                    "tool_calls": msg.get("tool_calls"),
+                    "tool_call_id": msg.get("tool_call_id"),
+                    "finish_reason": msg.get("finish_reason"),
+                    "reasoning": msg.get("reasoning"),
+                    "reasoning_details": msg.get("reasoning_details"),
+                    "codex_reasoning_items": msg.get("codex_reasoning_items"),
+                }
+            )
+
         def _do(conn):
             conn.execute(
-                "DELETE FROM messages WHERE session_id = ?", (session_id,)
+                """INSERT OR IGNORE INTO sessions (
+                       id, source, user_id, model, model_config, system_prompt,
+                       parent_session_id, started_at, ended_at, end_reason,
+                       message_count, tool_call_count, billing_provider,
+                       billing_base_url, title, summary
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    source,
+                    None,
+                    model,
+                    None,
+                    system_prompt,
+                    None,
+                    started_at,
+                    ended_at,
+                    "imported",
+                    0,
+                    0,
+                    provider,
+                    base_url,
+                    data.get("title"),
+                    data.get("summary"),
+                ),
             )
+
+            message_count = 0
+            tool_call_count = 0
+            timestamp = started_at
+            step = max(
+                0.001,
+                (max(ended_at, started_at) - started_at)
+                / max(len(serialized_messages), 1),
+            )
+            for msg in serialized_messages:
+                timestamp += step
+                tool_calls_json = (
+                    json.dumps(msg["tool_calls"]) if msg.get("tool_calls") else None
+                )
+                reasoning_details_json = (
+                    json.dumps(msg["reasoning_details"])
+                    if msg.get("reasoning_details")
+                    else None
+                )
+                codex_items_json = (
+                    json.dumps(msg["codex_reasoning_items"])
+                    if msg.get("codex_reasoning_items")
+                    else None
+                )
+                conn.execute(
+                    """INSERT INTO messages (
+                           session_id, role, content, tool_call_id, tool_calls,
+                           tool_name, timestamp, token_count, finish_reason,
+                           reasoning, reasoning_details, codex_reasoning_items
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        session_id,
+                        msg["role"],
+                        msg.get("content"),
+                        msg.get("tool_call_id"),
+                        tool_calls_json,
+                        msg.get("tool_name"),
+                        timestamp,
+                        None,
+                        msg.get("finish_reason"),
+                        msg.get("reasoning"),
+                        reasoning_details_json,
+                        codex_items_json,
+                    ),
+                )
+                message_count += 1
+                if msg.get("tool_calls"):
+                    tool_call_count += (
+                        len(msg["tool_calls"])
+                        if isinstance(msg["tool_calls"], list)
+                        else 1
+                    )
+
+            conn.execute(
+                """UPDATE sessions
+                   SET message_count = ?, tool_call_count = ?, ended_at = ?, end_reason = ?
+                   WHERE id = ?""",
+                (message_count, tool_call_count, ended_at, "imported", session_id),
+            )
+
+        self._execute_write(_do)
+        return session_id
+
+    def clear_messages(self, session_id: str) -> None:
+        """Delete all messages for a session and reset its counters."""
+
+        def _do(conn):
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute(
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
             )
+
         self._execute_write(_do)
 
     def delete_session(self, session_id: str) -> bool:
@@ -1241,6 +1816,7 @@ class SessionDB:
         first to satisfy the ``parent_session_id`` foreign key constraint.
         Returns True if the session was found and deleted.
         """
+
         def _do(conn):
             cursor = conn.execute(
                 "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
@@ -1248,10 +1824,13 @@ class SessionDB:
             if cursor.fetchone()[0] == 0:
                 return False
             # Delete child sessions first (FK constraint)
-            child_ids = [r[0] for r in conn.execute(
-                "SELECT id FROM sessions WHERE parent_session_id = ?",
-                (session_id,),
-            ).fetchall()]
+            child_ids = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT id FROM sessions WHERE parent_session_id = ?",
+                    (session_id,),
+                ).fetchall()
+            ]
             for cid in child_ids:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (cid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (cid,))
@@ -1259,6 +1838,7 @@ class SessionDB:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             return True
+
         return self._execute_write(_do)
 
     def prune_sessions(self, older_than_days: int = 90, source: str = None) -> int:
@@ -1287,10 +1867,13 @@ class SessionDB:
             # Delete children first whose parents are in the prune set
             # (avoids FK constraint errors)
             for sid in list(session_ids):
-                child_ids = [r[0] for r in conn.execute(
-                    "SELECT id FROM sessions WHERE parent_session_id = ?",
-                    (sid,),
-                ).fetchall()]
+                child_ids = [
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT id FROM sessions WHERE parent_session_id = ?",
+                        (sid,),
+                    ).fetchall()
+                ]
                 for cid in child_ids:
                     conn.execute("DELETE FROM messages WHERE session_id = ?", (cid,))
                     conn.execute("DELETE FROM sessions WHERE id = ?", (cid,))
