@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -49,7 +50,7 @@ from hermes_cli.config import (
 from gateway.status import get_running_pid, read_runtime_status
 
 try:
-    from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
@@ -908,6 +909,48 @@ def get_model_info():
     except Exception:
         _log.exception("GET /api/model/info failed")
         return dict(_EMPTY_MODEL_INFO)
+
+
+@app.post("/api/upload-image")
+async def upload_image(file: UploadFile = File(...)):
+    """Accept an image upload from the dashboard and save it to ~/.hermes/images.
+
+    Returns the absolute path so the dashboard can inject ``/image <path>``
+    into the terminal for the TUI to attach.
+    """
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    img_dir = get_hermes_home() / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ext = Path(file.filename or "upload.png").suffix.lower()
+    if ext not in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
+        ext = ".png"
+    dest = img_dir / f"dashboard_clip_{ts}_{secrets.token_hex(4)}{ext}"
+
+    try:
+        data = await file.read()
+        dest.write_bytes(data)
+    except Exception as e:
+        _log.exception("Image upload failed")
+        raise HTTPException(status_code=500, detail=f"Failed to save image: {e}")
+
+    meta: Dict[str, Any] = {"path": str(dest), "name": dest.name}
+    try:
+        from PIL import Image as PILImage
+
+        with PILImage.open(dest) as im:
+            w, h = im.size
+            meta["width"] = w
+            meta["height"] = h
+            tiles_x = max(1, (w + 511) // 512)
+            tiles_y = max(1, (h + 511) // 512)
+            meta["token_estimate"] = tiles_x * tiles_y * 85
+    except Exception:
+        pass
+    return meta
 
 
 def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -2270,6 +2313,406 @@ async def get_usage_analytics(days: int = 30):
     finally:
         db.close()
 
+
+
+# ---------------------------------------------------------------------------
+# ScrollPrize / Vesuvius AutoResearch dashboard endpoints
+# ---------------------------------------------------------------------------
+
+_SCROLLS_PROJECT_ROOT = Path(os.environ.get(
+    "HERMES_SCROLLS_RESEARCH_ROOT",
+    str(Path.home() / "projects" / "vesuvius-autoresearch"),
+)).expanduser()
+
+
+class ScrollsRunConfigBody(BaseModel):
+    config: str
+
+
+def _scrolls_safe_config_name(name: str) -> str:
+    candidate = Path(name).name
+    if candidate != name or not (candidate.endswith(".yaml") or candidate.endswith(".yml") or candidate.endswith(".json")):
+        raise HTTPException(status_code=400, detail="Config must be a file name under configs/ ending in .yaml, .yml, or .json")
+    return candidate
+
+
+def _scrolls_tail(path: Path, lines: int = 80) -> list[str]:
+    try:
+        if not path.exists():
+            return []
+        text = path.read_text(errors="replace").splitlines()
+        return text[-lines:]
+    except Exception as exc:
+        return [f"<failed to read {path}: {exc}>"]
+
+
+def _scrolls_read_yaml_json(path: Path) -> dict:
+    try:
+        with path.open("r") as fh:
+            if path.suffix == ".json":
+                value = json.load(fh)
+            else:
+                value = yaml.safe_load(fh)
+        return value if isinstance(value, dict) else {}
+    except Exception as exc:
+        return {"_error": str(exc)}
+
+
+def _scrolls_lock_active(project_root: Path) -> bool:
+    lock_path = project_root / "logs" / "autoresearch.lock"
+    if not lock_path.exists():
+        return False
+    try:
+        import fcntl
+        with lock_path.open("a+") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                return False
+            except BlockingIOError:
+                return True
+    except Exception:
+        return False
+
+
+def _scrolls_data_summary(project_root: Path) -> dict:
+    if not project_root.exists():
+        return {"source": "missing_project", "scrolls": [], "splits": {}}
+    script = (
+        "import json; "
+        "from data.vesuvius_data import get_dataset_summary; "
+        "print(json.dumps(get_dataset_summary()))"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(project_root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return json.loads(proc.stdout)
+        return {"source": "summary_error", "error": proc.stderr.strip() or proc.stdout.strip(), "scrolls": [], "splits": {}}
+    except Exception as exc:
+        return {"source": "summary_error", "error": str(exc), "scrolls": [], "splits": {}}
+
+
+def _scrolls_prepared_datasets(project_root: Path) -> list[dict]:
+    prepared = project_root / "data" / "prepared"
+    if not prepared.exists():
+        return []
+    items: list[dict] = []
+    for meta_path in sorted(prepared.glob("**/metadata.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+        try:
+            metadata = json.loads(meta_path.read_text())
+        except Exception as exc:
+            metadata = {"_error": str(exc)}
+        npz = next(meta_path.parent.glob("*.npz"), None)
+        items.append({"path": str(npz or meta_path.parent), "metadata": metadata})
+    return items[:50]
+
+
+def _scrolls_configs(project_root: Path) -> list[dict]:
+    cfg_dir = project_root / "configs"
+    if not cfg_dir.exists():
+        return []
+    out: list[dict] = []
+    paths = list(cfg_dir.glob("*.yaml")) + list(cfg_dir.glob("*.yml")) + list(cfg_dir.glob("*.json"))
+    for cfg in sorted(paths, key=lambda x: x.stat().st_mtime, reverse=True):
+        out.append({
+            "name": cfg.name,
+            "path": str(cfg),
+            "modified_at": cfg.stat().st_mtime,
+            "summary": _scrolls_read_yaml_json(cfg),
+        })
+    return out
+
+
+def _scrolls_artifact_files(artifact_dir: str | None, limit: int = 8) -> list[dict]:
+    if not artifact_dir:
+        return []
+    root = Path(artifact_dir).expanduser()
+    if not root.exists() or not root.is_dir():
+        return []
+    files: list[dict] = []
+    try:
+        for path in sorted((p for p in root.iterdir() if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True):
+            stat = path.stat()
+            files.append({
+                "name": path.name,
+                "path": str(path),
+                "size_bytes": stat.st_size,
+                "modified_at": stat.st_mtime,
+                "kind": path.suffix.lstrip(".") or "file",
+            })
+            if len(files) >= limit:
+                break
+    except Exception:
+        return files
+    return files
+
+
+def _scrolls_get_nested(obj: dict, path: tuple[str, ...], default=None):
+    cur = obj
+    for part in path:
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return cur
+
+
+def _scrolls_json_key(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        return str(value)
+
+
+def _scrolls_flatten_config(obj: Any, prefix: str = "", out: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    if out is None:
+        out = {}
+    if isinstance(obj, dict):
+        if not obj and prefix:
+            out[prefix] = {}
+        for key, value in obj.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            _scrolls_flatten_config(value, path, out)
+    elif isinstance(obj, list):
+        out[prefix] = obj
+    elif prefix:
+        out[prefix] = obj
+    return out
+
+
+def _scrolls_config_diff(before: Optional[dict], after: Optional[dict], limit: int = 32) -> list[dict]:
+    """Return a JSON-safe leaf-level config diff for dashboard projections."""
+    left = _scrolls_flatten_config(before or {})
+    right = _scrolls_flatten_config(after or {})
+    diffs: list[dict] = []
+    for path in sorted(set(left) | set(right)):
+        before_value = left.get(path)
+        after_value = right.get(path)
+        if _scrolls_json_key(before_value) == _scrolls_json_key(after_value):
+            continue
+        diffs.append({"path": path, "before": before_value, "after": after_value})
+        if len(diffs) >= limit:
+            break
+    return diffs
+
+
+def _scrolls_hypotheses(runs_chronological: list[dict], limit: int = 12) -> list[dict]:
+    """Project run ledger entries into compact hypothesis/outcome records.
+
+    Vocabulary: experiments are the durable ledger; this is only a read model.
+    Lower ``main_metric`` is treated as better because current ScrollPrize runs
+    optimize validation loss.
+    """
+    projected: list[dict] = []
+    previous: Optional[dict] = None
+    for run in runs_chronological:
+        diff = _scrolls_config_diff(previous.get("config") if previous else None, run.get("config"), limit=16)
+        changed_paths = [item["path"] for item in diff]
+        reason = _scrolls_get_nested(run.get("config", {}), ("autoresearch", "parent_reason"), None)
+        if reason is None:
+            reason = _scrolls_get_nested(run.get("config", {}), ("autoresearch", "hypothesis"), None)
+        delta = None
+        improved = None
+        status = "inconclusive"
+        if previous is not None:
+            delta = run["main_metric"] - previous["main_metric"]
+            improved = delta < 0
+            if delta < -1e-12:
+                status = "improved"
+            elif delta > 1e-12:
+                status = "regressed"
+        projected.append({
+            "run_id": run["run_id"],
+            "timestamp": run["timestamp"],
+            "reason": str(reason) if reason is not None else None,
+            "changed_paths": changed_paths,
+            "metric": run["main_metric"],
+            "previous_metric": previous["main_metric"] if previous else None,
+            "metric_delta_vs_previous": delta,
+            "improved_vs_previous": improved,
+            "status": status,
+        })
+        previous = run
+    return list(reversed(projected))[:limit]
+
+
+def _scrolls_experiments(project_root: Path) -> dict:
+    db_path = project_root / "experiments" / "experiments.db"
+    empty = {
+        "count": 0,
+        "best": None,
+        "recent": [],
+        "metric_trends": [],
+        "validation_matrix": [],
+        "latest": None,
+        "config_diffs": {"latest_vs_previous": [], "latest_vs_best": [], "latest_vs_baseline": []},
+        "hypotheses": [],
+    }
+    if not db_path.exists():
+        return empty
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0]
+            rows = conn.execute(
+                "SELECT run_id,timestamp,config_json,main_metric,secondary_metrics_json,artifact_dir "
+                "FROM experiments ORDER BY timestamp DESC LIMIT 120"
+            ).fetchall()
+            best_row = conn.execute(
+                "SELECT run_id,timestamp,config_json,main_metric,secondary_metrics_json,artifact_dir "
+                "FROM experiments ORDER BY main_metric ASC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        def row_to_run(row, include_artifacts: bool = True) -> dict:
+            metrics = json.loads(row["secondary_metrics_json"] or "{}")
+            cfg = json.loads(row["config_json"] or "{}")
+            run = {
+                "run_id": row["run_id"],
+                "timestamp": row["timestamp"],
+                "main_metric": float(row["main_metric"]),
+                "metrics": metrics,
+                "config": cfg,
+                "artifact_dir": row["artifact_dir"],
+            }
+            if include_artifacts:
+                run["artifacts"] = _scrolls_artifact_files(row["artifact_dir"])
+            return run
+
+        runs = [row_to_run(r) for r in rows]
+        best = row_to_run(best_row) if best_row else None
+
+        # Dashboard projections: cheap summaries derived from the durable run ledger.
+        chronological = list(reversed(runs))[-30:]
+        metric_trends = [
+            {
+                "run_id": r["run_id"],
+                "timestamp": r["timestamp"],
+                "main_metric": r["main_metric"],
+                "val_loss": r["metrics"].get("val_loss"),
+                "val_f1": r["metrics"].get("val_f1"),
+                "precision": r["metrics"].get("precision"),
+                "recall": r["metrics"].get("recall"),
+            }
+            for r in chronological
+        ]
+
+        matrix: dict[tuple[str, str], dict] = {}
+        for r in runs:
+            cfg = r["config"]
+            train_scroll = str(_scrolls_get_nested(cfg, ("dataset", "train_scroll_id"), "?"))
+            val_scroll = str(_scrolls_get_nested(cfg, ("dataset", "val_scroll_id"), "?"))
+            key = (train_scroll, val_scroll)
+            prev = matrix.get(key)
+            if prev is None or r["main_metric"] < prev["best_main_metric"]:
+                matrix[key] = {
+                    "train_scroll_id": train_scroll,
+                    "val_scroll_id": val_scroll,
+                    "best_run_id": r["run_id"],
+                    "best_main_metric": r["main_metric"],
+                    "best_val_f1": r["metrics"].get("val_f1"),
+                    "run_count": 1 if prev is None else prev["run_count"] + 1,
+                    "latest_timestamp": r["timestamp"],
+                }
+            else:
+                prev["run_count"] += 1
+                prev["latest_timestamp"] = max(str(prev.get("latest_timestamp", "")), str(r["timestamp"]))
+        validation_matrix = sorted(matrix.values(), key=lambda x: (x["train_scroll_id"], x["val_scroll_id"]))
+
+        latest = runs[0] if runs else None
+        previous = runs[1] if len(runs) > 1 else None
+        baseline = chronological[0] if chronological else None
+        config_diffs = {
+            "latest_vs_previous": _scrolls_config_diff(previous.get("config") if previous else None, latest.get("config") if latest else None),
+            "latest_vs_best": _scrolls_config_diff(best.get("config") if best else None, latest.get("config") if latest else None),
+            "latest_vs_baseline": _scrolls_config_diff(baseline.get("config") if baseline else None, latest.get("config") if latest else None),
+        }
+        hypotheses = _scrolls_hypotheses(chronological)
+
+        return {
+            "count": int(count),
+            "best": best,
+            "latest": latest,
+            "recent": runs[:50],
+            "metric_trends": metric_trends,
+            "validation_matrix": validation_matrix,
+            "config_diffs": config_diffs,
+            "hypotheses": hypotheses,
+        }
+    except Exception as exc:
+        out = dict(empty)
+        out["error"] = str(exc)
+        return out
+
+
+def _scrolls_cron_status(project_root: Path) -> dict:
+    needle = f"cd {project_root}"
+    try:
+        proc = subprocess.run(["crontab", "-l"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        lines = proc.stdout.splitlines() if proc.returncode == 0 else []
+        line = next((ln for ln in lines if needle in ln and "autoresearch.py" in ln), None)
+        return {"installed": line is not None, "line": line}
+    except Exception as exc:
+        return {"installed": False, "line": None, "error": str(exc)}
+
+
+@app.get("/api/scrolls/research")
+async def get_scrolls_research():
+    project_root = _SCROLLS_PROJECT_ROOT
+    log_path = project_root / "logs" / "autoresearch.log"
+    return {
+        "project_root": str(project_root),
+        "exists": project_root.exists(),
+        "data_summary": _scrolls_data_summary(project_root),
+        "prepared_datasets": _scrolls_prepared_datasets(project_root),
+        "configs": _scrolls_configs(project_root),
+        "experiments": _scrolls_experiments(project_root),
+        "cron": _scrolls_cron_status(project_root),
+        "logs": {"path": str(log_path), "lines": _scrolls_tail(log_path)},
+        "lock_active": _scrolls_lock_active(project_root),
+    }
+
+
+def _scrolls_spawn(command: list[str], project_root: Path) -> dict:
+    if not project_root.exists():
+        raise HTTPException(status_code=404, detail=f"Scrolls project not found: {project_root}")
+    if _scrolls_lock_active(project_root):
+        raise HTTPException(status_code=409, detail="AutoResearch is already running")
+    logs_dir = project_root / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / "autoresearch.log"
+    with log_path.open("ab") as log_fh:
+        proc = subprocess.Popen(
+            command,
+            cwd=str(project_root),
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    return {"ok": True, "pid": proc.pid, "command": command, "log_path": str(log_path)}
+
+
+@app.post("/api/scrolls/autoresearch/trigger")
+async def trigger_scrolls_autoresearch():
+    return _scrolls_spawn([sys.executable, "autoresearch.py"], _SCROLLS_PROJECT_ROOT)
+
+
+@app.post("/api/scrolls/experiments/run")
+async def run_scrolls_experiment(body: ScrollsRunConfigBody):
+    config_name = _scrolls_safe_config_name(body.config)
+    config_path = _SCROLLS_PROJECT_ROOT / "configs" / config_name
+    if not config_path.exists():
+        raise HTTPException(status_code=404, detail=f"Config not found: {config_name}")
+    return _scrolls_spawn([sys.executable, "run_experiment.py", "--config", str(config_path)], _SCROLLS_PROJECT_ROOT)
 
 # ---------------------------------------------------------------------------
 # /api/pty — PTY-over-WebSocket bridge for the dashboard "Chat" tab.

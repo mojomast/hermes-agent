@@ -357,6 +357,36 @@ class SessionDB:
                     pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 8")
 
+            # Defensive self-healing for databases whose schema_version was
+            # advanced without all expected columns present (for example after a
+            # partial migration or cross-version checkout switch).  These are
+            # idempotent and keep session replay from failing with "no such
+            # column" even when current_version >= the migration that introduced
+            # the column.
+            expected_messages_columns = [
+                ("reasoning", "TEXT"),
+                ("reasoning_content", "TEXT"),
+                ("reasoning_details", "TEXT"),
+                ("codex_reasoning_items", "TEXT"),
+            ]
+            existing_message_columns = {
+                row[1] for row in cursor.execute("PRAGMA table_info(messages)")
+            }
+            for col_name, col_type in expected_messages_columns:
+                if col_name not in existing_message_columns:
+                    safe = col_name.replace('"', '""')
+                    cursor.execute(
+                        f'ALTER TABLE messages ADD COLUMN "{safe}" {col_type}'
+                    )
+
+            existing_session_columns = {
+                row[1] for row in cursor.execute("PRAGMA table_info(sessions)")
+            }
+            if "api_call_count" not in existing_session_columns:
+                cursor.execute(
+                    'ALTER TABLE sessions ADD COLUMN "api_call_count" INTEGER DEFAULT 0'
+                )
+
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
         try:

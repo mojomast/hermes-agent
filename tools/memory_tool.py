@@ -113,11 +113,21 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        memory_inject_char_limit: Optional[int] = None,
+        user_inject_char_limit: Optional[int] = None,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        # Optional prompt-injection caps. These do NOT change write limits or
+        # persisted entries; they only bound the frozen system prompt snapshot.
+        self.memory_inject_char_limit = memory_inject_char_limit
+        self.user_inject_char_limit = user_inject_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
@@ -135,8 +145,16 @@ class MemoryStore:
 
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
-            "memory": self._render_block("memory", self.memory_entries),
-            "user": self._render_block("user", self.user_entries),
+            "memory": self._render_block(
+                "memory",
+                self.memory_entries,
+                inject_char_limit=self.memory_inject_char_limit,
+            ),
+            "user": self._render_block(
+                "user",
+                self.user_entries,
+                inject_char_limit=self.user_inject_char_limit,
+            ),
         }
 
     @staticmethod
@@ -388,20 +406,63 @@ class MemoryStore:
             resp["message"] = message
         return resp
 
-    def _render_block(self, target: str, entries: List[str]) -> str:
-        """Render a system prompt block with header and usage indicator."""
+    def _render_block(
+        self,
+        target: str,
+        entries: List[str],
+        inject_char_limit: Optional[int] = None,
+    ) -> str:
+        """Render a system prompt block with header and usage indicator.
+
+        ``inject_char_limit`` caps only the prompt snapshot. The full on-disk
+        memory remains available through memory/session/Becomussy retrieval and
+        the normal memory tool write limits remain unchanged.
+        """
         if not entries:
             return ""
 
         limit = self._char_limit(target)
-        content = ENTRY_DELIMITER.join(entries)
+        original_content = ENTRY_DELIMITER.join(entries)
+        original_current = len(original_content)
+        rendered_entries = entries
+        omitted = 0
+
+        if inject_char_limit is not None and inject_char_limit > 0 and original_current > inject_char_limit:
+            kept: List[str] = []
+            used = 0
+            delim_len = len(ENTRY_DELIMITER)
+            for entry in entries:
+                next_len = len(entry) if not kept else delim_len + len(entry)
+                if kept and used + next_len > inject_char_limit:
+                    omitted += 1
+                    continue
+                if not kept and len(entry) > inject_char_limit:
+                    kept.append(entry[:inject_char_limit].rstrip() + "…")
+                    used = len(kept[-1])
+                    omitted += 1
+                    continue
+                if used + next_len <= inject_char_limit:
+                    kept.append(entry)
+                    used += next_len
+                else:
+                    omitted += 1
+            rendered_entries = kept
+
+        content = ENTRY_DELIMITER.join(rendered_entries)
         current = len(content)
-        pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
+        pct = min(100, int((original_current / limit) * 100)) if limit > 0 else 0
 
         if target == "user":
-            header = f"USER PROFILE (who the user is) [{pct}% — {current:,}/{limit:,} chars]"
+            header = f"USER PROFILE (who the user is) [{pct}% — {original_current:,}/{limit:,} chars]"
         else:
-            header = f"MEMORY (your personal notes) [{pct}% — {current:,}/{limit:,} chars]"
+            header = f"MEMORY (your personal notes) [{pct}% — {original_current:,}/{limit:,} chars]"
+
+        if omitted:
+            content += (
+                f"\n§\n[Prompt memory injection capped at {inject_char_limit:,} chars; "
+                f"{omitted} entr{'y' if omitted == 1 else 'ies'} omitted. "
+                "Use Becomussy, session_search, or memory files for historical details.]"
+            )
 
         separator = "═" * 46
         return f"{separator}\n{header}\n{separator}\n{content}"

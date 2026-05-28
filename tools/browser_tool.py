@@ -200,6 +200,17 @@ def _get_command_timeout() -> int:
     return result
 
 
+def _load_browser_config() -> Dict[str, Any]:
+    """Load the browser section from config.yaml."""
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {}) if isinstance(cfg, dict) else {}
+        return browser_cfg if isinstance(browser_cfg, dict) else {}
+    except Exception:
+        return {}
+
+
 def _get_vision_model() -> Optional[str]:
     """Model for browser_vision (screenshot analysis — multimodal)."""
     return os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
@@ -976,6 +987,21 @@ BROWSER_TOOL_SCHEMAS = [
                 }
             },
             "required": []
+        }
+    },
+    {
+        "name": "browser_task",
+        "description": "Use browser_task only when interaction is required (logins, forms, multi-step flows, JS-heavy dashboards). It forwards a high-level task to a configured self-hosted browser worker and returns the worker transcript plus extracted data. For simple reading/search, prefer web_search or fetch_url.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "High-level task goal for the browser worker"},
+                "start_url": {"type": "string", "description": "Optional URL where the browser task should start"},
+                "domain_whitelist": {"type": "array", "items": {"type": "string"}, "description": "Optional allowed domains for navigation"},
+                "max_steps": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum browser actions/observations allowed"},
+                "data_schema": {"type": "object", "description": "Optional JSON schema/hints for extracted data"}
+            },
+            "required": ["goal"]
         }
     },
 ]
@@ -2463,6 +2489,88 @@ def cleanup_all_browsers() -> None:
 
 
 # ============================================================================
+# High-level browser task worker wrapper
+# ============================================================================
+
+def _browser_task_config() -> Dict[str, Any]:
+    cfg = _load_browser_config()
+    worker_url = (
+        os.getenv("BROWSER_TASK_WORKER_URL", "").strip()
+        or os.getenv("BROWSER_WORKER_URL", "").strip()
+        or str(cfg.get("task_worker_url") or cfg.get("worker_url") or "").strip()
+    ).rstrip("/")
+    try:
+        timeout = int(os.getenv("BROWSER_TASK_TIMEOUT", "") or cfg.get("task_timeout") or 120)
+    except (TypeError, ValueError):
+        timeout = 120
+    try:
+        default_max_steps = int(os.getenv("BROWSER_TASK_DEFAULT_MAX_STEPS", "") or cfg.get("task_default_max_steps") or 10)
+    except (TypeError, ValueError):
+        default_max_steps = 10
+    return {"worker_url": worker_url, "timeout": max(timeout, 5), "default_max_steps": max(1, min(default_max_steps, 50))}
+
+
+def check_browser_task_worker() -> bool:
+    """Return true when a self-hosted browser worker endpoint is configured."""
+    return bool(_browser_task_config().get("worker_url"))
+
+
+def browser_task(
+    goal: str,
+    start_url: Optional[str] = None,
+    domain_whitelist: Optional[List[str]] = None,
+    max_steps: Optional[int] = None,
+    data_schema: Optional[Dict[str, Any]] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """Forward a high-level interactive task to a self-hosted browser worker."""
+    cfg = _browser_task_config()
+    worker_url = cfg.get("worker_url")
+    if not worker_url:
+        return tool_error(
+            "browser_task worker is not configured. Set browser.task_worker_url or BROWSER_TASK_WORKER_URL.",
+            success=False,
+            ok=False,
+        )
+    if start_url:
+        if not _is_safe_url(start_url):
+            return tool_error("Unsafe start_url blocked", success=False, ok=False, start_url=start_url)
+        blocked = check_website_access(start_url)
+        if blocked:
+            return json.dumps({"success": False, "ok": False, "error": blocked["message"], "blocked_by_policy": blocked}, ensure_ascii=False)
+    steps = max_steps if max_steps is not None else cfg.get("default_max_steps", 10)
+    try:
+        steps = max(1, min(int(steps), 50))
+    except (TypeError, ValueError):
+        steps = cfg.get("default_max_steps", 10)
+    payload: Dict[str, Any] = {
+        "goal": goal,
+        "start_url": start_url,
+        "domain_whitelist": domain_whitelist or [],
+        "max_steps": steps,
+    }
+    if data_schema:
+        payload["data_schema"] = data_schema
+    if task_id:
+        payload["task_id"] = task_id
+    logger.info("browser_task goal=%r start_url=%s max_steps=%s worker=%s", goal, start_url, steps, worker_url)
+    try:
+        response = requests.post(f"{worker_url}/task", json=payload, timeout=cfg.get("timeout", 120))
+        response.raise_for_status()
+        result = response.json()
+    except Exception as exc:
+        logger.warning("browser_task worker call failed: %s", exc)
+        return tool_error(f"browser_task worker call failed: {exc}", success=False, ok=False)
+    if not isinstance(result, dict):
+        return tool_error("browser_task worker returned non-object JSON", success=False, ok=False)
+    result.setdefault("ok", bool(result.get("success", True)))
+    result.setdefault("success", bool(result.get("ok", True)))
+    transcript = result.get("transcript") if isinstance(result.get("transcript"), list) else []
+    logger.info("browser_task complete ok=%s transcript_steps=%d final_url=%s", result.get("ok"), len(transcript), result.get("final_url"))
+    return json.dumps(result, ensure_ascii=False)
+
+
+# ============================================================================
 # Requirements Check
 # ============================================================================
 
@@ -2634,4 +2742,20 @@ registry.register(
     handler=lambda args, **kw: browser_console(clear=args.get("clear", False), expression=args.get("expression"), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="🖥️",
+)
+registry.register(
+    name="browser_task",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_task"],
+    handler=lambda args, **kw: browser_task(
+        goal=args.get("goal", ""),
+        start_url=args.get("start_url"),
+        domain_whitelist=args.get("domain_whitelist"),
+        max_steps=args.get("max_steps"),
+        data_schema=args.get("data_schema"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_task_worker,
+    requires_env=["BROWSER_TASK_WORKER_URL"],
+    emoji="🤖",
 )

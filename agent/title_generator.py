@@ -26,7 +26,16 @@ def generate_title(user_message: str, assistant_response: str, timeout: float = 
     Returns the title string or None on failure.
     """
     # Truncate long messages to keep the request small
-    user_snippet = user_message[:500] if user_message else ""
+    if isinstance(user_message, list):
+        text_bits = []
+        for part in user_message:
+            if isinstance(part, dict) and part.get("type") in ("text", "input_text"):
+                t = part.get("text", "")
+                if isinstance(t, str):
+                    text_bits.append(t)
+        user_snippet = " ".join(text_bits)[:500]
+    else:
+        user_snippet = user_message[:500] if user_message else ""
     assistant_snippet = assistant_response[:500] if assistant_response else ""
 
     messages = [

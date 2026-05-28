@@ -52,7 +52,7 @@ Or in-session:
 
 | Toolset | Tools | Purpose |
 |---------|-------|---------|
-| `browser` | `browser_back`, `browser_cdp`, `browser_click`, `browser_console`, `browser_dialog`, `browser_get_images`, `browser_navigate`, `browser_press`, `browser_scroll`, `browser_snapshot`, `browser_type`, `browser_vision`, `web_search` | Full browser automation. Includes `web_search` as a fallback for quick lookups. `browser_cdp` and `browser_dialog` are gated on a reachable CDP endpoint — they only appear when `/browser connect` is active, `browser.cdp_url` is set, or a Browserbase session is active. `browser_dialog` works together with the `pending_dialogs` and `frame_tree` fields that `browser_snapshot` adds when a CDP supervisor is attached. |
+| `browser` | `browser_back`, `browser_cdp`, `browser_click`, `browser_console`, `browser_dialog`, `browser_get_images`, `browser_navigate`, `browser_press`, `browser_scroll`, `browser_snapshot`, `browser_task`, `browser_type`, `browser_vision`, `web_search` | Full browser automation. Includes `web_search` as a fallback for quick lookups. `browser_task` forwards high-level tasks to a configured self-hosted worker. `browser_cdp` and `browser_dialog` are gated on a reachable CDP endpoint — they only appear when `/browser connect` is active, `browser.cdp_url` is set, or a Browserbase session is active. `browser_dialog` works together with the `pending_dialogs` and `frame_tree` fields that `browser_snapshot` adds when a CDP supervisor is attached. |
 | `clarify` | `clarify` | Ask the user a question when the agent needs clarification. |
 | `code_execution` | `execute_code` | Run Python scripts that call Hermes tools programmatically. |
 | `cronjob` | `cronjob` | Schedule and manage recurring tasks. |
@@ -73,7 +73,7 @@ Or in-session:
 | `todo` | `todo` | Task list management within a session. |
 | `tts` | `text_to_speech` | Text-to-speech audio generation. |
 | `vision` | `vision_analyze` | Image analysis via vision-capable models. |
-| `web` | `web_extract`, `web_search` | Web search and page content extraction. |
+| `web` | `fetch_url`, `web_extract`, `web_search` | Web search and page content extraction. `fetch_url` extracts a known URL locally with trafilatura. |
 
 ## Composite Toolsets
 
@@ -81,8 +81,8 @@ These expand to multiple core toolsets, providing a convenient shorthand for com
 
 | Toolset | Expands to | Use case |
 |---------|-----------|----------|
-| `debugging` | `web` + `file` + `process`, `terminal` (via `includes`) — effectively `patch`, `process`, `read_file`, `search_files`, `terminal`, `web_extract`, `web_search`, `write_file` | Debug sessions — file access, terminal, and web research without browser or delegation overhead. |
-| `safe` | `image_generate`, `vision_analyze`, `web_extract`, `web_search` | Read-only research and media generation. No file writes, no terminal access, no code execution. Good for untrusted or constrained environments. |
+| `debugging` | `web` + `file` + `process`, `terminal` (via `includes`) — effectively `fetch_url`, `patch`, `process`, `read_file`, `search_files`, `terminal`, `web_extract`, `web_search`, `write_file` | Debug sessions — file access, terminal, and web research without browser or delegation overhead. |
+| `safe` | `fetch_url`, `image_generate`, `vision_analyze`, `web_extract`, `web_search` | Read-only research and media generation. No file writes, no terminal access, no code execution. Good for untrusted or constrained environments. |
 
 ## Platform Toolsets
 

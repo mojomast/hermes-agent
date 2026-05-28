@@ -88,13 +88,15 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
-        return configured
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "searxng", "ask-search", "ask_search"):
+        return "ask-search" if configured == "ask_search" else configured
 
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Firecrawl also counts as available when the managed
     # tool gateway is configured for Nous subscribers.
     backend_candidates = (
+        ("searxng", _is_backend_available("searxng")),
+        ("ask-search", _is_backend_available("ask-search")),
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
@@ -117,6 +119,8 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend in ("searxng", "ask-search"):
+        return bool(_get_local_search_config(backend).get("base_url"))
     return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -1032,7 +1036,196 @@ async def _parallel_extract(urls: List[str]) -> List[Dict[str, Any]]:
     return results
 
 
-def web_search_tool(query: str, limit: int = 5) -> str:
+def _get_local_search_config(backend: str) -> Dict[str, Any]:
+    """Return config for self-hosted SearXNG / ask-search search backends."""
+    web_cfg = _load_web_config() or {}
+    env_prefix = "ASK_SEARCH" if backend == "ask-search" else "SEARXNG"
+    section_names = ("ask_search", "ask-search") if backend == "ask-search" else ("searxng",)
+    section: Dict[str, Any] = {}
+    for name in section_names:
+        value = web_cfg.get(name)
+        if isinstance(value, dict):
+            section = value
+            break
+
+    base_url = (
+        os.getenv(f"{env_prefix}_BASE_URL", "").strip()
+        or str(section.get("base_url") or "").strip()
+    ).rstrip("/")
+    default_path = "/search"
+    search_path = (
+        os.getenv(f"{env_prefix}_SEARCH_PATH", "").strip()
+        or str(section.get("search_path") or section.get("endpoint") or default_path).strip()
+    )
+    if not search_path.startswith("/"):
+        search_path = "/" + search_path
+    try:
+        timeout = float(os.getenv(f"{env_prefix}_TIMEOUT", "") or section.get("timeout") or 15)
+    except (TypeError, ValueError):
+        timeout = 15.0
+    try:
+        default_limit = int(os.getenv(f"{env_prefix}_DEFAULT_LIMIT", "") or section.get("default_limit") or web_cfg.get("default_result_limit") or 5)
+    except (TypeError, ValueError):
+        default_limit = 5
+    return {
+        "base_url": base_url,
+        "search_path": search_path,
+        "timeout": timeout,
+        "default_limit": default_limit,
+    }
+
+
+def _normalize_local_search_results(payload: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
+    """Normalize SearXNG/ask-search payloads to Hermes web result objects."""
+    raw_results = payload.get("results") or payload.get("web") or payload.get("data", {}).get("web") or []
+    if isinstance(raw_results, dict):
+        raw_results = raw_results.get("results", [])
+    results: List[Dict[str, Any]] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("name") or "").strip()
+        url = str(item.get("url") or item.get("href") or item.get("link") or "").strip()
+        snippet = str(item.get("snippet") or item.get("content") or item.get("description") or item.get("body") or "").strip()
+        if not title and not url:
+            continue
+        result: Dict[str, Any] = {
+            "title": title,
+            "url": url,
+            "description": snippet,
+            "snippet": snippet,
+            "position": len(results) + 1,
+            "rank": len(results) + 1,
+        }
+        if item.get("score") is not None:
+            result["score"] = item.get("score")
+        results.append(result)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _local_search(backend: str, query: str, limit: int, language: Optional[str] = None, safe: Optional[str] = None) -> dict:
+    cfg = _get_local_search_config(backend)
+    if not cfg.get("base_url"):
+        raise ValueError(f"{backend} base_url is not configured (set web.{backend}.base_url or {backend.upper().replace('-', '_')}_BASE_URL)")
+    effective_limit = max(1, min(int(limit or cfg.get("default_limit") or 5), 50))
+    url = f"{cfg['base_url']}{cfg['search_path']}"
+    params: Dict[str, Any] = {"q": query, "format": "json"}
+    if language:
+        params["language"] = language
+    if safe is not None:
+        params["safesearch"] = safe
+    logger.info("local_web_search %s query=%r limit=%d endpoint=%s", backend, query, effective_limit, url)
+    response = httpx.get(url, params=params, timeout=cfg.get("timeout", 15))
+    response.raise_for_status()
+    payload = response.json()
+    web_results = _normalize_local_search_results(payload if isinstance(payload, dict) else {}, effective_limit)
+    logger.info("local_web_search %s result_count=%d", backend, len(web_results))
+    return {"success": True, "provider": backend, "data": {"web": web_results}}
+
+
+def _is_probably_binary_url(url: str) -> bool:
+    from urllib.parse import urlparse
+    path = urlparse(url).path.lower()
+    return path.endswith((
+        ".pdf", ".zip", ".tar", ".tgz", ".tar.gz", ".gz", ".bz2", ".xz",
+        ".7z", ".rar", ".exe", ".dmg", ".iso", ".png", ".jpg", ".jpeg",
+        ".gif", ".webp", ".mp4", ".mov", ".avi", ".mp3", ".wav",
+    ))
+
+
+def _get_fetch_url_config() -> Dict[str, Any]:
+    web_cfg = _load_web_config() or {}
+    cfg = web_cfg.get("fetch_url") if isinstance(web_cfg.get("fetch_url"), dict) else {}
+    def _int_value(name: str, default: int) -> int:
+        try:
+            return int(os.getenv(name, "") or cfg.get(name.lower().replace("fetch_url_", "")) or default)
+        except (TypeError, ValueError):
+            return default
+    return {
+        "timeout": _int_value("FETCH_URL_TIMEOUT", 30),
+        "max_content_chars": _int_value("FETCH_URL_MAX_CONTENT_CHARS", 100_000),
+    }
+
+
+def _extract_trafilatura_content(raw: Any, output_format: str) -> tuple[str, Dict[str, Any]]:
+    """Parse trafilatura JSON extraction into content + metadata."""
+    if output_format == "json":
+        content = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+        metadata: Dict[str, Any] = {}
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                metadata = {k: v for k, v in parsed.items() if k not in {"text", "raw_text", "comments"} and v not in (None, "")}
+        except Exception:
+            pass
+        return content, metadata
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                content = str(parsed.get("text") or parsed.get("raw_text") or "")
+                metadata = {k: v for k, v in parsed.items() if k not in {"text", "raw_text", "comments"} and v not in (None, "")}
+                return content, metadata
+        except Exception:
+            return raw, {}
+    return str(raw or ""), {}
+
+
+def fetch_url_tool(url: str, output_format: str = "markdown", include_metadata: bool = True) -> str:
+    """Fetch and extract main page content locally with trafilatura."""
+    output_format = (output_format or "markdown").lower().strip()
+    if output_format not in {"markdown", "txt", "json"}:
+        return tool_error("format must be one of: markdown, txt, json", success=False, ok=False)
+    if not is_safe_url(url):
+        return tool_error("Unsafe URL blocked", success=False, ok=False, url=url)
+    blocked = check_website_access(url)
+    if blocked:
+        return json.dumps({"success": False, "ok": False, "url": url, "error": blocked["message"], "blocked_by_policy": blocked}, ensure_ascii=False)
+    if _is_probably_binary_url(url):
+        return tool_error("Refusing to fetch likely binary/download URL; use a document/PDF-specific tool if needed", success=False, ok=False, url=url)
+    cfg = _get_fetch_url_config()
+    logger.info("fetch_url url=%s format=%s", url, output_format)
+    try:
+        import trafilatura  # type: ignore
+    except Exception as exc:
+        return tool_error(f"trafilatura is not installed: {exc}", success=False, ok=False, url=url)
+    try:
+        downloaded = trafilatura.fetch_url(url, timeout=cfg.get("timeout", 30))
+    except TypeError:
+        downloaded = trafilatura.fetch_url(url)
+    except Exception as exc:
+        return tool_error(f"download failed: {exc}", success=False, ok=False, url=url)
+    if not downloaded:
+        return tool_error("download failed or returned empty content", success=False, ok=False, url=url)
+    extract_format = "json" if include_metadata or output_format != "txt" else "txt"
+    try:
+        raw = trafilatura.extract(downloaded, output_format=extract_format, with_metadata=include_metadata)
+    except Exception as exc:
+        return tool_error(f"content extraction failed: {exc}", success=False, ok=False, url=url)
+    if not raw:
+        return tool_error("content extraction returned empty content", success=False, ok=False, url=url)
+    content, metadata = _extract_trafilatura_content(raw, output_format)
+    max_chars = int(cfg.get("max_content_chars") or 100_000)
+    truncated = False
+    if len(content) > max_chars:
+        content = content[:max_chars] + f"\n\n[truncated to {max_chars} characters]"
+        truncated = True
+    logger.info("fetch_url complete url=%s content_length=%d truncated=%s", url, len(content), truncated)
+    return json.dumps({
+        "success": True,
+        "ok": True,
+        "url": url,
+        "format": output_format,
+        "content": content,
+        "metadata": metadata,
+        "truncated": truncated,
+        "content_length": len(content),
+    }, ensure_ascii=False)
+
+
+def web_search_tool(query: str, limit: int = 5, language: Optional[str] = None, safe: Optional[str] = None) -> str:
     """
     Search the web for information using available search API backend.
 
@@ -1111,6 +1304,15 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 "include_images": False,
             })
             response_data = _normalize_tavily_search_results(raw)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
+        if backend in ("searxng", "ask-search"):
+            response_data = _local_search(backend, query, limit, language=language, safe=safe)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
@@ -1922,9 +2124,16 @@ def check_firecrawl_api_key() -> bool:
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in ("exa", "parallel", "firecrawl", "tavily"):
+    if configured == "ask_search":
+        configured = "ask-search"
+    if configured in ("exa", "parallel", "tavily", "searxng", "ask-search"):
         return _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily"))
+    if configured == "firecrawl":
+        return _is_backend_available(configured) or any(
+            _is_backend_available(backend)
+            for backend in ("searxng", "ask-search", "exa", "parallel", "tavily")
+        )
+    return any(_is_backend_available(backend) for backend in ("searxng", "ask-search", "exa", "parallel", "firecrawl", "tavily"))
 
 
 def check_auxiliary_model() -> bool:
@@ -2047,13 +2256,27 @@ from tools.registry import registry, tool_error
 
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
-    "description": "Search the web for information on any topic. Returns up to 5 relevant results with titles, URLs, and descriptions.",
+    "description": "Use web_search when you need to discover sources, news, or answer questions from the open web. Searches the configured self-hosted SearXNG/ask-search endpoint when web.backend is searxng/ask-search, otherwise the configured legacy backend. Returns normalized title/url/snippet results.",
     "parameters": {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
                 "description": "The search query to look up on the web"
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of results to return (default from config, normally 5)",
+                "minimum": 1,
+                "maximum": 50
+            },
+            "language": {
+                "type": "string",
+                "description": "Optional SearXNG language code (e.g. en, en-US)"
+            },
+            "safe": {
+                "type": "string",
+                "description": "Optional SearXNG safesearch value (0, 1, or 2)"
             }
         },
         "required": ["query"]
@@ -2062,7 +2285,7 @@ WEB_SEARCH_SCHEMA = {
 
 WEB_EXTRACT_SCHEMA = {
     "name": "web_extract",
-    "description": "Extract content from web page URLs. Returns page content in markdown format. Also works with PDF URLs (arxiv papers, documents, etc.) — pass the PDF link directly and it converts to markdown text. Pages under 5000 chars return full markdown; larger pages are LLM-summarized and capped at ~5000 chars per page. Pages over 2M chars are refused. If a URL fails or times out, use the browser tool to access it instead.",
+    "description": "Extract content from web page URLs. Returns page content in markdown format. Also works with PDF URLs (arxiv papers, documents, etc.) — pass the PDF link directly and it converts to markdown text. Pages under 5000 chars return full markdown; larger pages are LLM-summarized and capped at ~5000 chars per page. Pages over 2M chars are refused. If a URL fails or times out, use fetch_url for local trafilatura extraction or browser_task when interaction/JavaScript is required.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -2077,14 +2300,54 @@ WEB_EXTRACT_SCHEMA = {
     }
 }
 
+FETCH_URL_SCHEMA = {
+    "name": "fetch_url",
+    "description": "Use fetch_url when you already know the URL and need the main content as markdown/text/JSON for reading, summarization, or RAG. It runs locally with Python trafilatura and does not require paid APIs or cloud keys.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "HTTP/HTTPS URL to fetch and extract"},
+            "format": {
+                "type": "string",
+                "enum": ["markdown", "txt", "json"],
+                "description": "Output format. markdown is the default."
+            },
+            "include_metadata": {
+                "type": "boolean",
+                "description": "Include trafilatura metadata when available (default true)"
+            }
+        },
+        "required": ["url"]
+    }
+}
+
 registry.register(
     name="web_search",
     toolset="web",
     schema=WEB_SEARCH_SCHEMA,
-    handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=5),
+    handler=lambda args, **kw: web_search_tool(
+        args.get("query", ""),
+        limit=args.get("limit") or _get_local_search_config(_get_backend()).get("default_limit", 5) if _get_backend() in ("searxng", "ask-search") else args.get("limit", 5),
+        language=args.get("language"),
+        safe=args.get("safe"),
+    ),
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
     emoji="🔍",
+    max_result_size_chars=100_000,
+)
+registry.register(
+    name="fetch_url",
+    toolset="web",
+    schema=FETCH_URL_SCHEMA,
+    handler=lambda args, **kw: fetch_url_tool(
+        args.get("url", ""),
+        output_format=args.get("format", "markdown"),
+        include_metadata=args.get("include_metadata", True),
+    ),
+    check_fn=None,
+    requires_env=[],
+    emoji="📄",
     max_result_size_chars=100_000,
 )
 registry.register(

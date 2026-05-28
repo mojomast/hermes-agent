@@ -466,6 +466,9 @@ DEFAULT_CONFIG = {
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
         "allow_private_urls": False,  # Allow navigating to private/internal IPs (localhost, 192.168.x.x, etc.)
         "cdp_url": "",  # Optional persistent CDP endpoint for attaching to an existing Chromium/Chrome
+        "task_worker_url": "",  # Optional self-hosted browser_task worker origin (e.g. http://localhost:8765)
+        "task_timeout": 120,  # HTTP timeout for browser_task worker requests
+        "task_default_max_steps": 10,  # Default browser_task interaction cap enforced by Hermes wrapper and worker
         # CDP supervisor — dialog + frame detection via a persistent WebSocket.
         # Active only when a CDP-capable backend is attached (Browserbase or
         # local Chrome via /browser connect). See
@@ -477,6 +480,30 @@ DEFAULT_CONFIG = {
             # so the server maps it to a persistent Firefox profile automatically.
             # When false (default), each session gets a random userId (ephemeral).
             "managed_persistence": False,
+        },
+    },
+
+    "web": {
+        # Backward-compatible hosted default. Set backend to "searxng" or
+        # "ask-search" and configure the local HTTP endpoint to opt in to
+        # self-hosted, keyless search. Parallel, Tavily, and Exa remain supported.
+        "backend": "firecrawl",
+        "default_result_limit": 5,
+        "searxng": {
+            "base_url": "",  # e.g. http://localhost:8080 or http://searxng:8080
+            "search_path": "/search",
+            "default_limit": 5,
+            "timeout": 15,
+        },
+        "ask_search": {
+            "base_url": "",  # e.g. http://localhost:8000 or http://ask-search:8000
+            "search_path": "/search",
+            "default_limit": 5,
+            "timeout": 15,
+        },
+        "fetch_url": {
+            "timeout": 30,
+            "max_content_chars": 100_000,
         },
     },
 
@@ -739,6 +766,17 @@ DEFAULT_CONFIG = {
     # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
         "engine": "compressor",
+        # Prompt assembly mode. "lean" is default for token throughput: cap
+        # memory injection and use compact skills retrieval. Set to "full" for
+        # legacy/autonomous runs that truly need every skill listed up front.
+        # Override per process with HERMES_CONTEXT_MODE.
+        "prompt_mode": "lean",
+        # Explicit prompt caps override mode defaults. Empty/None = mode default.
+        "memory_inject_char_limit": None,
+        "user_profile_inject_char_limit": None,
+        # "full" injects the full skill inventory; "compact" injects only
+        # retrieval instructions/category counts; "off" omits skill guidance.
+        "skills_index_mode": "compact",
     },
 
     # Persistent memory -- bounded curated memory injected into system prompt

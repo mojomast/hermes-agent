@@ -621,6 +621,7 @@ def _skill_should_show(
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
+    index_mode: str = "full",
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -638,6 +639,12 @@ def build_skills_system_prompt(
     """
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+    mode = (index_mode or "full").strip().lower()
+    if mode not in {"full", "compact", "off"}:
+        mode = "full"
+
+    if mode == "off":
+        return ""
 
     if not skills_dir.exists() and not external_dirs:
         return ""
@@ -659,6 +666,7 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        mode,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -794,6 +802,26 @@ def build_skills_system_prompt(
 
     if not skills_by_category:
         result = ""
+    elif mode == "compact":
+        category_lines = []
+        total_skills = 0
+        for category in sorted(skills_by_category.keys()):
+            seen = {name for name, _desc in skills_by_category[category]}
+            total_skills += len(seen)
+            cat_desc = category_descriptions.get(category, "")
+            if cat_desc:
+                category_lines.append(f"  - {category} ({len(seen)}): {cat_desc}")
+            else:
+                category_lines.append(f"  - {category} ({len(seen)} skills)")
+        result = (
+            "## Skills (retrieval mode)\n"
+            "Skills are available, but the full inventory is intentionally not injected to save context. "
+            "When a task may need specialized procedure, call skills_list (optionally with category) to discover candidates, "
+            "then skill_view(name) for the relevant skill before acting. Patch outdated skills with skill_manage.\n"
+            f"Available skill categories ({total_skills} total skills):\n"
+            + "\n".join(category_lines) + "\n"
+            "Only skip skill retrieval when the task is trivial or no category is relevant."
+        )
     else:
         index_lines = []
         for category in sorted(skills_by_category.keys()):

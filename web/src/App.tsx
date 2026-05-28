@@ -33,6 +33,7 @@ import {
   Package,
   Puzzle,
   RotateCw,
+  ScrollText,
   Settings,
   Shield,
   Sparkles,
@@ -58,6 +59,7 @@ import LogsPage from "@/pages/LogsPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
 import CronPage from "@/pages/CronPage";
 import SkillsPage from "@/pages/SkillsPage";
+import ScrollsPage from "@/pages/ScrollsPage";
 import ChatPage from "@/pages/ChatPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
@@ -85,6 +87,8 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/analytics": AnalyticsPage,
   "/logs": LogsPage,
   "/cron": CronPage,
+  "/scrolls": ScrollsPage,
+  "/scrollprize": ScrollsPage,
   "/skills": SkillsPage,
   "/config": ConfigPage,
   "/env": EnvPage,
@@ -106,6 +110,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
   },
   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
+  { path: "/scrollprize", label: "ScrollPrize", icon: ScrollText },
   { path: "/skills", labelKey: "skills", label: "Skills", icon: Package },
   { path: "/config", labelKey: "config", label: "Config", icon: Settings },
   { path: "/env", labelKey: "keys", label: "Keys", icon: KeyRound },
@@ -125,6 +130,8 @@ const ICON_MAP: Record<string, ComponentType<{ className?: string }>> = {
   KeyRound,
   MessageSquare,
   Package,
+  RotateCw,
+  ScrollText,
   Settings,
   Puzzle,
   Sparkles,

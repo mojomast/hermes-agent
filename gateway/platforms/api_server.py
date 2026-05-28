@@ -827,7 +827,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
-        conversation_messages: List[Dict[str, str]] = []
+        conversation_messages: List[Dict[str, Any]] = []
 
         for idx, msg in enumerate(messages):
             role = msg.get("role", "")
@@ -948,7 +948,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 if event_type != "tool.started":
                     return
-                if name.startswith("_"):
+                if not name or name.startswith("_"):
                     return
                 from agent.display import get_tool_emoji
                 emoji = get_tool_emoji(name)
@@ -957,6 +957,28 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": name,
                     "emoji": emoji,
                     "label": label,
+                    "arguments": args or {},
+                }))
+
+            def _on_tool_start(tool_call_id, name, args):
+                if not name or name.startswith("_"):
+                    return
+                _stream_q.put(("__tool_call__", {
+                    "type": "tool_call",
+                    "call_id": tool_call_id,
+                    "name": name,
+                    "arguments": args or {},
+                }))
+
+            def _on_tool_complete(tool_call_id, name, args, result):
+                if not name or name.startswith("_"):
+                    return
+                _stream_q.put(("__tool_output__", {
+                    "type": "tool_output",
+                    "call_id": tool_call_id,
+                    "name": name,
+                    "arguments": args or {},
+                    "output": result,
                 }))
 
             # Start agent in background.  agent_ref is a mutable container
@@ -969,6 +991,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
+                tool_start_callback=_on_tool_start,
+                tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
             ))
 
@@ -1085,11 +1109,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 frontends can display them without storing the markers in
                 conversation history.  See #6972.
                 """
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
-                    event_data = json.dumps(item[1])
-                    await response.write(
-                        f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
-                    )
+                if isinstance(item, tuple) and len(item) == 2:
+                    tag, payload = item
+                    if tag == "__tool_progress__":
+                        event_data = json.dumps(payload)
+                        await response.write(
+                            f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                        )
+                    elif tag in {"__tool_call__", "__tool_output__"}:
+                        event_name = "hermes.tool.call" if tag == "__tool_call__" else "hermes.tool.output"
+                        event_data = json.dumps({"hermes": payload})
+                        await response.write(
+                            f"event: {event_name}\ndata: {event_data}\n\n".encode()
+                        )
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -2239,8 +2271,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _run_agent(
         self,
-        user_message: str,
-        conversation_history: List[Dict[str, str]],
+        user_message: Any,
+        conversation_history: List[Dict[str, Any]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
@@ -2567,7 +2599,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
-            self._app = web.Application(middlewares=mws)
+            self._app = web.Application(middlewares=mws, client_max_size=10*1024*1024)
             self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)

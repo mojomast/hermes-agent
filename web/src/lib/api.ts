@@ -67,6 +67,18 @@ export const api = {
   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
   getSchema: () => fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>("/api/config/schema"),
   getModelInfo: () => fetchJSON<ModelInfoResponse>("/api/model/info"),
+  uploadImage: (file: File) => {
+    const token = window.__HERMES_SESSION_TOKEN__;
+    const form = new FormData();
+    form.append("file", file);
+    const headers = new Headers();
+    if (token) headers.set(SESSION_HEADER, token);
+    return fetchJSON<UploadImageResponse>("/api/upload-image", {
+      method: "POST",
+      headers,
+      body: form,
+    });
+  },
   saveConfig: (config: Record<string, unknown>) =>
     fetchJSON<{ ok: boolean }>("/api/config", {
       method: "PUT",
@@ -131,6 +143,17 @@ export const api = {
       body: JSON.stringify({ name, enabled }),
     }),
   getToolsets: () => fetchJSON<ToolsetInfo[]>("/api/tools/toolsets"),
+
+  // ScrollPrize / Vesuvius research dashboard
+  getScrollsResearch: () => fetchJSON<ScrollsResearchResponse>("/api/scrolls/research"),
+  triggerScrollsAutoresearch: () =>
+    fetchJSON<ScrollsActionResponse>("/api/scrolls/autoresearch/trigger", { method: "POST" }),
+  runScrollsConfig: (config: string) =>
+    fetchJSON<ScrollsActionResponse>("/api/scrolls/experiments/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config }),
+    }),
 
   // Session search (FTS5)
   searchSessions: (q: string) =>
@@ -431,6 +454,14 @@ export interface ModelInfoResponse {
   };
 }
 
+export interface UploadImageResponse {
+  path: string;
+  name: string;
+  width?: number;
+  height?: number;
+  token_estimate?: number;
+}
+
 // ── OAuth provider types ────────────────────────────────────────────────
 
 export interface OAuthProviderStatus {
@@ -523,4 +554,106 @@ export interface PluginManifestResponse {
   css?: string | null;
   has_api: boolean;
   source: string;
+}
+
+
+// ── ScrollPrize / Vesuvius AutoResearch types ─────────────────────────
+export interface ScrollsArtifactFile {
+  name: string;
+  path: string;
+  size_bytes: number;
+  modified_at: number;
+  kind: string;
+}
+
+export interface ScrollsExperimentRun {
+  run_id: string;
+  timestamp: string;
+  main_metric: number;
+  metrics: Record<string, unknown>;
+  config: Record<string, unknown>;
+  artifact_dir: string;
+  artifacts?: ScrollsArtifactFile[];
+}
+
+export interface ScrollsMetricTrendPoint {
+  run_id: string;
+  timestamp: string;
+  main_metric: number;
+  val_loss?: number | null;
+  val_f1?: number | null;
+  precision?: number | null;
+  recall?: number | null;
+}
+
+export interface ScrollsValidationMatrixCell {
+  train_scroll_id: string;
+  val_scroll_id: string;
+  best_run_id: string;
+  best_main_metric: number;
+  best_val_f1?: number | null;
+  run_count: number;
+  latest_timestamp: string;
+}
+
+export interface ScrollsConfigDiffEntry {
+  path: string;
+  before?: unknown;
+  after?: unknown;
+}
+
+export interface ScrollsHypothesisProjection {
+  run_id: string;
+  timestamp: string;
+  reason?: string | null;
+  changed_paths: string[];
+  metric: number;
+  previous_metric?: number | null;
+  metric_delta_vs_previous?: number | null;
+  improved_vs_previous?: boolean | null;
+  status: "improved" | "regressed" | "inconclusive";
+}
+
+export interface ScrollsConfigInfo {
+  name: string;
+  path: string;
+  modified_at: number;
+  summary: Record<string, unknown>;
+}
+
+export interface ScrollsPreparedDataset {
+  path: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface ScrollsResearchResponse {
+  project_root: string;
+  exists: boolean;
+  data_summary: Record<string, unknown>;
+  prepared_datasets: ScrollsPreparedDataset[];
+  configs: ScrollsConfigInfo[];
+  experiments: {
+    count: number;
+    best: ScrollsExperimentRun | null;
+    latest?: ScrollsExperimentRun | null;
+    recent: ScrollsExperimentRun[];
+    metric_trends?: ScrollsMetricTrendPoint[];
+    validation_matrix?: ScrollsValidationMatrixCell[];
+    config_diffs?: {
+      latest_vs_previous?: ScrollsConfigDiffEntry[];
+      latest_vs_best?: ScrollsConfigDiffEntry[];
+      latest_vs_baseline?: ScrollsConfigDiffEntry[];
+    };
+    hypotheses?: ScrollsHypothesisProjection[];
+  };
+  cron: { installed: boolean; line: string | null };
+  logs: { path: string; lines: string[] };
+  lock_active: boolean;
+}
+
+export interface ScrollsActionResponse {
+  ok: boolean;
+  pid: number;
+  command: string[];
+  log_path: string;
 }

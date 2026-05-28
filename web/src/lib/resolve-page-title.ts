@@ -25,6 +25,9 @@ export function resolvePageTitle(
   if (plugin) {
     return plugin.label;
   }
+  if (normalized === "/scrolls" || normalized === "/scrollprize") {
+    return "ScrollPrize";
+  }
   const key = BUILTIN[normalized];
   if (key) {
     return t.app.nav[key];

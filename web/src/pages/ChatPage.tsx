@@ -32,6 +32,7 @@ import { useSearchParams } from "react-router-dom";
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
+import { api } from "@/lib/api";
 
 function buildWsUrl(
   token: string,
@@ -98,6 +99,82 @@ function terminalFontSizeForWidth(layoutWidthPx: number): number {
 
 function terminalLineHeightForWidth(layoutWidthPx: number): number {
   return layoutWidthPx < 1024 ? 1.02 : 1.15;
+}
+
+/**
+ * Upload pasted images and inject ``/image <path>`` commands into the
+ * terminal, followed by any plain text that was also on the clipboard.
+ */
+async function uploadPastedImages(
+  term: Terminal,
+  ws: WebSocket | null,
+  files: File[],
+  text: string,
+): Promise<void> {
+  console.log("[hermes-paste] uploading", files.length, "image(s), text:", text.slice(0, 50));
+  for (const file of files) {
+    try {
+      console.log("[hermes-paste] uploading", file.name, file.type, file.size);
+      const meta = await api.uploadImage(file);
+      console.log("[hermes-paste] upload ok", meta.path);
+      const cmd = `/image ${meta.path}`;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(cmd);
+        // Small delay so the PTY processes the command before the newline
+        await new Promise((r) => setTimeout(r, 50));
+        ws.send("\r");
+      } else {
+        term.paste(cmd);
+        term.paste("\r");
+      }
+    } catch (err) {
+      console.error("[hermes-paste] upload failed", err);
+      term.write(
+        `\r\n\x1b[91m[image upload failed: ${(err as Error).message}]\x1b[0m\r\n`,
+      );
+    }
+  }
+  if (text) {
+    console.log("[hermes-paste] pasting text");
+    term.paste(text);
+  }
+}
+
+/**
+ * Handle clipboard paste via the modern async Clipboard API.
+ * Kept for potential future use but currently unused — we rely on the
+ * native `paste` event in capture phase for cross-platform reliability.
+ */
+// @ts-expect-error unused for now
+async function handleClipboardPaste(term: Terminal, ws: WebSocket | null): Promise<void> {
+  try {
+    const items = await navigator.clipboard.read();
+    let text = "";
+    const images: File[] = [];
+    for (const item of items) {
+      for (const type of item.types) {
+        if (type.startsWith("image/")) {
+          const blob = await item.getType(type);
+          const ext = type.split("/")[1] || "png";
+          images.push(new File([blob], `paste.${ext}`, { type }));
+        } else if (type === "text/plain" && !text) {
+          const blob = await item.getType(type);
+          text = await blob.text();
+        }
+      }
+    }
+    if (images.length > 0 || text) {
+      await uploadPastedImages(term, ws, images, text);
+    }
+  } catch {
+    // Fallback to plain text only
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) term.paste(text);
+    } catch {
+      // ignore
+    }
+  }
 }
 
 export default function ChatPage() {
@@ -302,14 +379,12 @@ export default function ChatPage() {
       }
 
       if (pasteModifier && ev.key.toLowerCase() === "v") {
-        navigator.clipboard
-          .readText()
-          .then((text) => {
-            if (text) term.paste(text);
-          })
-          .catch(() => {});
-        ev.preventDefault();
-        return false;
+        // Deliberately do NOT intercept here.  We rely on the native
+        // `paste` event (captured in the capture phase on `host`) so that
+        // image pastes go through `e.clipboardData.items`, which is more
+        // reliable than `navigator.clipboard.read()` and does not require
+        // special permissions.
+        return true;
       }
 
       return true;
@@ -326,6 +401,35 @@ export default function ChatPage() {
     term.loadAddon(new WebLinksAddon());
 
     term.open(host);
+
+    // Native paste handler — catches Ctrl+V on non-Mac platforms and any
+    // browser paste that bypasses our custom key handler.  If the clipboard
+    // contains image files we upload them and inject ``/image <path>`` into
+    // the terminal; text is passed through to xterm as normal.
+    //
+    // We listen in the *capture* phase because xterm.js calls
+    // `stopPropagation()` in its own paste handler, which would swallow the
+    // event before it bubbles up to `host`.
+    const onPaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      console.log("[hermes-paste] paste event", items ? items.length : 0, "items");
+      if (!items) return;
+      const imageItems = Array.from(items).filter(
+        (item) => item.kind === "file" && item.type.startsWith("image/"),
+      );
+      console.log("[hermes-paste] image items:", imageItems.length);
+      if (imageItems.length === 0) return; // let xterm handle text-only paste
+
+      e.preventDefault();
+      e.stopImmediatePropagation();
+
+      const files = imageItems
+        .map((item) => item.getAsFile())
+        .filter((f): f is File => f !== null);
+      const text = e.clipboardData?.getData("text/plain") || "";
+      uploadPastedImages(term, ws, files, text);
+    };
+    host.addEventListener("paste", onPaste, true);
 
     // WebGL draws from a texture atlas sized with device pixels. On phones and
     // in DevTools device mode that often produces *visually* much larger cells
@@ -547,6 +651,7 @@ export default function ChatPage() {
 
     return () => {
       unmounting = true;
+      host.removeEventListener("paste", onPaste, true);
       onDataDisposable.dispose();
       onResizeDisposable.dispose();
       if (metricsDebounce) clearTimeout(metricsDebounce);

@@ -1209,23 +1209,65 @@ Environment scrubbing (strips `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, 
 
 ## Web Search Backends
 
-The `web_search`, `web_extract`, and `web_crawl` tools support four backend providers. Configure the backend in `config.yaml` or via `hermes tools`:
+`web_search` supports hosted and self-hosted backend providers. `web_extract` and `web_crawl` continue to use the hosted extraction/crawl providers where supported. Configure the backend in `config.yaml` or via `hermes tools`:
 
 ```yaml
 web:
-  backend: firecrawl    # firecrawl | parallel | tavily | exa
+  backend: firecrawl    # auto | firecrawl | parallel | tavily | exa | searxng | ask-search | ask_search
 ```
 
-| Backend | Env Var | Search | Extract | Crawl |
-|---------|---------|--------|---------|-------|
+| Backend | Env/config | Search | Extract | Crawl |
+|---------|------------|--------|---------|-------|
 | **Firecrawl** (default) | `FIRECRAWL_API_KEY` | ✔ | ✔ | ✔ |
 | **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ | — |
 | **Tavily** | `TAVILY_API_KEY` | ✔ | ✔ | ✔ |
 | **Exa** | `EXA_API_KEY` | ✔ | ✔ | — |
+| **SearXNG** | `web.searxng.base_url` or `SEARXNG_BASE_URL` | ✔ | — | — |
+| **ask-search** / **ask_search** | `web.ask_search.base_url` or `ASK_SEARCH_BASE_URL` | ✔ | — | — |
 
-**Backend selection:** If `web.backend` is not set, the backend is auto-detected from available API keys. If only `EXA_API_KEY` is set, Exa is used. If only `TAVILY_API_KEY` is set, Tavily is used. If only `PARALLEL_API_KEY` is set, Parallel is used. Otherwise Firecrawl is the default.
+**Backend selection:** If `web.backend` is `auto` or omitted, the backend is auto-detected from available API keys. If only `EXA_API_KEY` is set, Exa is used. If only `TAVILY_API_KEY` is set, Tavily is used. If only `PARALLEL_API_KEY` is set, Parallel is used. Otherwise Firecrawl remains the backward-compatible default.
 
-**Self-hosted Firecrawl:** Set `FIRECRAWL_API_URL` to point at your own instance. When a custom URL is set, the API key becomes optional (set `USE_DB_AUTHENTICATION=false` on the server to disable auth).
+**Self-hosted search:** Set `web.backend` to `searxng`, `ask-search`, or `ask_search` and configure `base_url`. Hermes calls the local JSON endpoint from `tools/web_tools.py` with `q`, `format=json`, optional `language`, and optional `safesearch`, then normalizes results to `title`, `url`, `description`, `snippet`, `position`, `rank`, and optional `score`.
+
+```yaml
+web:
+  backend: searxng
+  searxng:
+    base_url: "http://localhost:8080"
+    search_path: "/search"
+    default_limit: 5
+    timeout: 15
+
+# Or:
+web:
+  backend: ask-search
+  ask_search:
+    base_url: "http://localhost:9000"
+    search_path: "/search"
+    default_limit: 5
+    timeout: 15
+```
+
+Example tool call:
+
+```json
+{"name": "web_search", "arguments": {"query": "Hermes Agent", "limit": 5}}
+```
+
+**`fetch_url`:** Fetch a URL and extract main page content locally using `trafilatura`. Inputs: `url` (string), `format` (`markdown`, `txt`, or `json`; default `markdown`), and optional `include_metadata` (boolean; default `true`). Output fields: `success`/`ok`, `url`, `format`, `content`, `metadata`, `truncated`, and `content_length`. It enforces URL safety, website policy, binary/download extension rejection, and `web.fetch_url.max_content_chars`.
+
+```yaml
+web:
+  fetch_url:
+    timeout: 30
+    max_content_chars: 100000
+```
+
+```json
+{"name": "fetch_url", "arguments": {"url": "https://example.com/article", "format": "markdown", "include_metadata": true}}
+```
+
+**Self-hosted Firecrawl:** Set `FIRECRAWL_API_URL` to point at your own instance. When a custom URL is set, the API key becomes optional if your self-hosted Firecrawl server has auth disabled.
 
 **Parallel search modes:** Set `PARALLEL_SEARCH_MODE` to control search behavior — `fast`, `one-shot`, or `agentic` (default: `agentic`).
 
@@ -1248,6 +1290,9 @@ browser:
   # /browser connect). Ignored on Camofox and default local agent-browser mode.
   dialog_policy: must_respond    # must_respond | auto_dismiss | auto_accept
   dialog_timeout_s: 300          # Safety auto-dismiss under must_respond (seconds)
+  task_worker_url: "http://localhost:9000"  # Optional self-hosted browser_task worker origin
+  task_timeout: 120           # HTTP timeout for browser_task worker requests
+  task_default_max_steps: 10  # Default browser_task interaction cap
   camofox:
     managed_persistence: false   # When true, Camofox sessions persist cookies/logins across restarts
 ```
@@ -1259,6 +1304,20 @@ browser:
 - `auto_accept` — capture, accept immediately. Useful for pages with aggressive `beforeunload` prompts.
 
 See the [browser feature page](./features/browser.md#browser_dialog) for the full dialog workflow.
+
+**`browser_task`:** For high-level interactive tasks, Hermes can forward work to a self-hosted HTTP browser worker at `{browser.task_worker_url}/task`. No external SaaS is required. Inputs: `goal`, `start_url`, `domain_whitelist`, `max_steps`, optional `data_schema`, and optional `task_id`. Outputs include `ok`, `success`, `transcript`, `final_url`, plus any additional fields returned by the worker.
+
+```json
+{
+  "name": "browser_task",
+  "arguments": {
+    "goal": "Open the test page and click the Continue button",
+    "start_url": "http://localhost:9000/test-page",
+    "domain_whitelist": ["localhost"],
+    "max_steps": 5
+  }
+}
+```
 
 The browser toolset supports multiple providers. See the [Browser feature page](/docs/user-guide/features/browser) for details on Browserbase, Browser Use, and local Chrome CDP setup.
 

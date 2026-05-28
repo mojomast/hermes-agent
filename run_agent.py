@@ -1581,9 +1581,54 @@ class AIAgent:
         self._memory_flush_min_turns = 6
         self._turns_since_memory = 0
         self._iters_since_skill = 0
+        self._context_prompt_mode = "full"
+        self._skills_index_mode = "full"
+        self._memory_inject_char_limit = None
+        self._user_inject_char_limit = None
         if not skip_memory:
             try:
                 mem_config = _agent_cfg.get("memory", {})
+                context_config = _agent_cfg.get("context", {}) or {}
+                context_mode = (
+                    os.environ.get("HERMES_CONTEXT_MODE")
+                    or context_config.get("prompt_mode")
+                    or "full"
+                )
+                context_mode = str(context_mode).strip().lower()
+                if context_mode not in {"full", "balanced", "lean"}:
+                    context_mode = "full"
+
+                def _optional_int(value, default=None):
+                    if value in (None, ""):
+                        return default
+                    try:
+                        parsed = int(value)
+                    except (TypeError, ValueError):
+                        return default
+                    return parsed if parsed > 0 else default
+
+                mode_memory_caps = {
+                    "full": (None, None),
+                    "balanced": (6000, 6000),
+                    "lean": (3000, 4000),
+                }
+                default_memory_cap, default_user_cap = mode_memory_caps[context_mode]
+                self._context_prompt_mode = context_mode
+                self._skills_index_mode = str(
+                    os.environ.get("HERMES_SKILLS_INDEX_MODE")
+                    or context_config.get("skills_index_mode")
+                    or ("compact" if context_mode in {"lean", "balanced"} else "full")
+                ).strip().lower()
+                self._memory_inject_char_limit = _optional_int(
+                    os.environ.get("HERMES_MEMORY_INJECT_CHAR_LIMIT")
+                    or context_config.get("memory_inject_char_limit"),
+                    default_memory_cap,
+                )
+                self._user_inject_char_limit = _optional_int(
+                    os.environ.get("HERMES_USER_PROFILE_INJECT_CHAR_LIMIT")
+                    or context_config.get("user_profile_inject_char_limit"),
+                    default_user_cap,
+                )
                 self._memory_enabled = mem_config.get("memory_enabled", False)
                 self._user_profile_enabled = mem_config.get("user_profile_enabled", False)
                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
@@ -1593,6 +1638,8 @@ class AIAgent:
                     self._memory_store = MemoryStore(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
                         user_char_limit=mem_config.get("user_char_limit", 1375),
+                        memory_inject_char_limit=self._memory_inject_char_limit,
+                        user_inject_char_limit=self._user_inject_char_limit,
                     )
                     self._memory_store.load_from_disk()
             except Exception:
@@ -4200,8 +4247,9 @@ class AIAgent:
         if not (self._memory_manager and final_response and original_user_message):
             return
         try:
-            self._memory_manager.sync_all(original_user_message, final_response)
-            self._memory_manager.queue_prefetch_all(original_user_message)
+            if isinstance(original_user_message, str):
+                self._memory_manager.sync_all(original_user_message, final_response)
+                self._memory_manager.queue_prefetch_all(original_user_message)
         except Exception:
             pass
 
@@ -4469,6 +4517,7 @@ class AIAgent:
             skills_prompt = build_skills_system_prompt(
                 available_tools=self.valid_tool_names,
                 available_toolsets=avail_toolsets,
+                index_mode=self._skills_index_mode,
             )
         else:
             skills_prompt = ""
@@ -5136,6 +5185,20 @@ class AIAgent:
         # returns empty output (e.g. chatgpt.com backend-api sends
         # response.incomplete instead of response.completed).
         self._codex_streamed_text_parts: list = []
+
+        def _synthesized_codex_text_response():
+            assembled = "".join(self._codex_streamed_text_parts)
+            return SimpleNamespace(
+                id="stream-" + str(uuid.uuid4()),
+                output=[SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text=assembled)],
+                )],
+                usage=None,
+            )
+
         for attempt in range(max_stream_retries + 1):
             collected_output_items: list = []
             try:
@@ -5200,19 +5263,22 @@ class AIAgent:
                                 len(collected_output_items),
                             )
                         elif self._codex_streamed_text_parts and not has_tool_calls:
-                            assembled = "".join(self._codex_streamed_text_parts)
-                            final_response.output = [SimpleNamespace(
-                                type="message",
-                                role="assistant",
-                                status="completed",
-                                content=[SimpleNamespace(type="output_text", text=assembled)],
-                            )]
+                            final_response.output = _synthesized_codex_text_response().output
                             logger.debug(
                                 "Codex stream: synthesized output from %d text deltas (%d chars)",
-                                len(self._codex_streamed_text_parts), len(assembled),
+                                len(self._codex_streamed_text_parts),
+                                sum(len(p) for p in self._codex_streamed_text_parts),
                             )
                     return final_response
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                if self._codex_streamed_text_parts and not has_tool_calls:
+                    logger.warning(
+                        "Codex Responses stream transport failed after text delivery; "
+                        "using streamed text instead of retrying to avoid duplicate replies. %s error=%s",
+                        self._client_log_context(),
+                        exc,
+                    )
+                    return _synthesized_codex_text_response()
                 if attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed (attempt %s/%s); retrying. %s error=%s",
@@ -5231,6 +5297,13 @@ class AIAgent:
             except RuntimeError as exc:
                 err_text = str(exc)
                 missing_completed = "response.completed" in err_text
+                if missing_completed and self._codex_streamed_text_parts and not has_tool_calls:
+                    logger.warning(
+                        "Codex Responses stream closed after text delivery without response.completed; "
+                        "using streamed text instead of retrying to avoid duplicate replies. %s",
+                        self._client_log_context(),
+                    )
+                    return _synthesized_codex_text_response()
                 if missing_completed and attempt < max_stream_retries:
                     logger.debug(
                         "Responses stream closed before completion (attempt %s/%s); retrying. %s",
@@ -9279,7 +9352,7 @@ class AIAgent:
 
     def run_conversation(
         self,
-        user_message: str,
+        user_message: Any,
         system_message: str = None,
         conversation_history: List[Dict[str, Any]] = None,
         task_id: str = None,

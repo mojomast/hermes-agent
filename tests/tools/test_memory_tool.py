@@ -222,6 +222,23 @@ class TestMemoryStoreSnapshot:
         assert "loaded at start" in snapshot
         assert "added later" not in snapshot
 
+    def test_snapshot_respects_injection_cap_without_deleting_entries(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        (tmp_path / "MEMORY.md").write_text("first compact fact\n§\nsecond bulky fact that should be omitted")
+
+        store = MemoryStore(
+            memory_char_limit=500,
+            user_char_limit=300,
+            memory_inject_char_limit=30,
+        )
+        store.load_from_disk()
+
+        snapshot = store.format_for_system_prompt("memory")
+        assert "first compact fact" in snapshot
+        assert "second bulky fact" not in snapshot
+        assert "omitted" in snapshot
+        assert len(store.memory_entries) == 2
+
     def test_empty_snapshot_returns_none(self, store):
         assert store.format_for_system_prompt("memory") is None
 

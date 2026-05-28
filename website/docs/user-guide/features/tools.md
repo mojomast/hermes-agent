@@ -20,9 +20,9 @@ High-level categories:
 
 | Category | Examples | Description |
 |----------|----------|-------------|
-| **Web** | `web_search`, `web_extract` | Search the web and extract page content. |
+| **Web** | `web_search`, `web_extract`, `fetch_url` | Search the web and extract page content. `fetch_url` extracts known URLs locally with trafilatura. |
 | **Terminal & Files** | `terminal`, `process`, `read_file`, `patch` | Execute commands and manipulate files. |
-| **Browser** | `browser_navigate`, `browser_snapshot`, `browser_vision` | Interactive browser automation with text and vision support. |
+| **Browser** | `browser_navigate`, `browser_snapshot`, `browser_task`, `browser_vision` | Interactive browser automation with text, vision, and optional self-hosted high-level task worker support. |
 | **Media** | `vision_analyze`, `image_generate`, `text_to_speech` | Multimodal analysis and generation. |
 | **Agent orchestration** | `todo`, `clarify`, `execute_code`, `delegate_task` | Planning, clarification, code execution, and subagent delegation. |
 | **Memory & recall** | `memory`, `session_search` | Persistent memory and session search. |
