@@ -88,7 +88,9 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa", "searxng", "ask-search", "ask_search"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "searxng", "ask-search", "ask_search", "duckduckgo", "ddg", "local"):
+        if configured in ("duckduckgo", "ddg", "local"):
+            return "duckduckgo"
         return "ask-search" if configured == "ask_search" else configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -101,12 +103,13 @@ def _get_backend() -> str:
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
+        ("duckduckgo", True),
     )
     for backend, available in backend_candidates:
         if available:
             return backend
 
-    return "firecrawl"  # default (backward compat)
+    return "duckduckgo"  # local/free fallback, no API key required
 
 
 def _is_backend_available(backend: str) -> bool:
@@ -121,6 +124,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("TAVILY_API_KEY")
     if backend in ("searxng", "ask-search"):
         return bool(_get_local_search_config(backend).get("base_url"))
+    if backend == "duckduckgo":
+        return True
     return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -1125,6 +1130,143 @@ def _local_search(backend: str, query: str, limit: int, language: Optional[str] 
     return {"success": True, "provider": backend, "data": {"web": web_results}}
 
 
+def _strip_html_to_text(html_text: str) -> str:
+    """Small stdlib HTML-to-text fallback for local web extraction."""
+    import html as html_lib
+    text = re.sub(r"(?is)<(script|style|noscript|svg|canvas)[^>]*>.*?</\1>", " ", html_text or "")
+    text = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", text)
+    text = re.sub(r"(?i)</\s*(p|div|section|article|header|footer|li|h[1-6]|tr)\s*>", "\n", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    lines = [re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    return "\n".join(lines)
+
+
+def _html_title(html_text: str) -> str:
+    import html as html_lib
+    m = re.search(r"(?is)<title[^>]*>(.*?)</title>", html_text or "")
+    if not m:
+        return ""
+    return re.sub(r"\s+", " ", html_lib.unescape(m.group(1))).strip()
+
+
+def _fetch_http_text(url: str, *, timeout: float = 30.0, max_chars: int = 100_000) -> Dict[str, Any]:
+    """Fetch text/html with httpx for local extraction fallbacks."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; HermesWebTools/1.0)",
+        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
+    }
+    response = httpx.get(url, headers=headers, follow_redirects=True, timeout=timeout)
+    response.raise_for_status()
+    content_type = response.headers.get("content-type", "")
+    raw_text = response.text or ""
+    text = raw_text[:max_chars]
+    is_html = "html" in content_type.lower() or "<html" in text[:500].lower()
+    return {
+        "url": str(response.url),
+        "status_code": response.status_code,
+        "content_type": content_type,
+        "html": text,
+        "text": _strip_html_to_text(text) if is_html else text,
+        "title": _html_title(text),
+        "truncated": len(raw_text) > max_chars,
+    }
+
+
+def _duckduckgo_search(query: str, limit: int) -> dict:
+    """DuckDuckGo HTML search fallback with no API key or third-party deps."""
+    import html as html_lib
+    from urllib.parse import parse_qs, urlencode, urlparse, unquote
+
+    effective_limit = max(1, min(int(limit or 5), 50))
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    response = httpx.post(
+        "https://html.duckduckgo.com/html/",
+        data=urlencode({"q": query}),
+        headers=headers,
+        follow_redirects=True,
+        timeout=20,
+    )
+    response.raise_for_status()
+    page = response.text or ""
+
+    results: List[Dict[str, Any]] = []
+    pattern = r"(?is)<a\b[^>]*class=[\"'][^\"']*result__a[^\"']*[\"'][^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>"
+    for match in re.finditer(pattern, page):
+        href = html_lib.unescape(match.group(1))
+        title = _strip_html_to_text(match.group(2)).replace("\n", " ").strip()
+        parsed = urlparse(href)
+        if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+            uddg = parse_qs(parsed.query).get("uddg")
+            if uddg:
+                href = unquote(uddg[0])
+        if not href.startswith(("http://", "https://")):
+            continue
+        after = page[match.end(): match.end() + 2000]
+        snippet = ""
+        snip = re.search(r"(?is)<a\b[^>]*class=[\"'][^\"']*result__snippet[^\"']*[\"'][^>]*>(.*?)</a>", after)
+        if not snip:
+            snip = re.search(r"(?is)<div\b[^>]*class=[\"'][^\"']*result__snippet[^\"']*[\"'][^>]*>(.*?)</div>", after)
+        if snip:
+            snippet = _strip_html_to_text(snip.group(1)).replace("\n", " ").strip()
+        if title or href:
+            results.append({
+                "title": title,
+                "url": href,
+                "description": snippet,
+                "snippet": snippet,
+                "position": len(results) + 1,
+                "rank": len(results) + 1,
+            })
+        if len(results) >= effective_limit:
+            break
+    return {"success": True, "provider": "duckduckgo", "data": {"web": results}}
+
+
+async def _local_extract(urls: List[str]) -> List[Dict[str, Any]]:
+    """Direct HTTP extraction fallback used by local/DuckDuckGo web backend."""
+    from tools.interrupt import is_interrupted
+    cfg = _get_fetch_url_config()
+    timeout = float(cfg.get("timeout", 30))
+    max_chars = int(cfg.get("max_content_chars") or 100_000)
+    results: List[Dict[str, Any]] = []
+    for url in urls:
+        if is_interrupted():
+            results.append({"url": url, "title": "", "content": "", "error": "Interrupted"})
+            continue
+        blocked = check_website_access(url)
+        if blocked:
+            results.append({"url": url, "title": "", "content": "", "error": blocked["message"], "blocked_by_policy": blocked})
+            continue
+        if _is_probably_binary_url(url):
+            results.append({"url": url, "title": "", "content": "", "error": "Refusing to fetch likely binary/download URL"})
+            continue
+        try:
+            fetched = await asyncio.to_thread(_fetch_http_text, url, timeout=timeout, max_chars=max_chars)
+            content = fetched.get("text") or ""
+            results.append({
+                "url": fetched.get("url") or url,
+                "title": fetched.get("title") or "",
+                "content": content,
+                "raw_content": content,
+                "metadata": {
+                    "sourceURL": fetched.get("url") or url,
+                    "title": fetched.get("title") or "",
+                    "status_code": fetched.get("status_code"),
+                    "content_type": fetched.get("content_type"),
+                    "truncated": fetched.get("truncated", False),
+                    "extractor": "local-httpx",
+                },
+            })
+        except Exception as exc:
+            results.append({"url": url, "title": "", "content": "", "error": f"local fetch failed: {exc}"})
+    return results
+
+
 def _is_probably_binary_url(url: str) -> bool:
     from urllib.parse import urlparse
     path = urlparse(url).path.lower()
@@ -1189,24 +1331,39 @@ def fetch_url_tool(url: str, output_format: str = "markdown", include_metadata: 
     logger.info("fetch_url url=%s format=%s", url, output_format)
     try:
         import trafilatura  # type: ignore
-    except Exception as exc:
-        return tool_error(f"trafilatura is not installed: {exc}", success=False, ok=False, url=url)
-    try:
-        downloaded = trafilatura.fetch_url(url, timeout=cfg.get("timeout", 30))
-    except TypeError:
-        downloaded = trafilatura.fetch_url(url)
-    except Exception as exc:
-        return tool_error(f"download failed: {exc}", success=False, ok=False, url=url)
-    if not downloaded:
-        return tool_error("download failed or returned empty content", success=False, ok=False, url=url)
-    extract_format = "json" if include_metadata or output_format != "txt" else "txt"
-    try:
-        raw = trafilatura.extract(downloaded, output_format=extract_format, with_metadata=include_metadata)
-    except Exception as exc:
-        return tool_error(f"content extraction failed: {exc}", success=False, ok=False, url=url)
-    if not raw:
-        return tool_error("content extraction returned empty content", success=False, ok=False, url=url)
-    content, metadata = _extract_trafilatura_content(raw, output_format)
+    except Exception:
+        trafilatura = None  # type: ignore
+
+    if trafilatura is not None:
+        try:
+            downloaded = trafilatura.fetch_url(url, timeout=cfg.get("timeout", 30))
+        except TypeError:
+            downloaded = trafilatura.fetch_url(url)
+        except Exception as exc:
+            return tool_error(f"download failed: {exc}", success=False, ok=False, url=url)
+        if not downloaded:
+            return tool_error("download failed or returned empty content", success=False, ok=False, url=url)
+        extract_format = "json" if include_metadata or output_format != "txt" else "txt"
+        try:
+            raw = trafilatura.extract(downloaded, output_format=extract_format, with_metadata=include_metadata)
+        except Exception as exc:
+            return tool_error(f"content extraction failed: {exc}", success=False, ok=False, url=url)
+        if not raw:
+            return tool_error("content extraction returned empty content", success=False, ok=False, url=url)
+        content, metadata = _extract_trafilatura_content(raw, output_format)
+    else:
+        try:
+            fetched = _fetch_http_text(url, timeout=float(cfg.get("timeout", 30)), max_chars=int(cfg.get("max_content_chars") or 100_000))
+        except Exception as exc:
+            return tool_error(f"local fetch failed: {exc}", success=False, ok=False, url=url)
+        content = str(fetched.get("text") or "")
+        metadata = {
+            "title": fetched.get("title") or "",
+            "sourceURL": fetched.get("url") or url,
+            "status_code": fetched.get("status_code"),
+            "content_type": fetched.get("content_type"),
+            "extractor": "local-httpx",
+        }
     max_chars = int(cfg.get("max_content_chars") or 100_000)
     truncated = False
     if len(content) > max_chars:
@@ -1320,12 +1477,31 @@ def web_search_tool(query: str, limit: int = 5, language: Optional[str] = None, 
             _debug.save()
             return result_json
 
+        if backend == "duckduckgo":
+            response_data = _duckduckgo_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
         logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
 
-        response = _get_firecrawl_client().search(
-            query=query,
-            limit=limit
-        )
+        try:
+            response = _get_firecrawl_client().search(
+                query=query,
+                limit=limit
+            )
+        except Exception as exc:
+            logger.warning("Firecrawl search failed (%s); falling back to DuckDuckGo", exc)
+            response_data = _duckduckgo_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
 
         web_results = _extract_web_search_results(response)
         results_count = len(web_results)
@@ -1421,6 +1597,7 @@ async def web_extract_tool(
         "compression_metrics": [],
         "processing_applied": []
     }
+    safe_urls: List[str] = []
     
     try:
         logger.info("Extracting content from %d URL(s)", len(urls))
@@ -1454,6 +1631,8 @@ async def web_extract_tool(
                     "include_images": False,
                 })
                 results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
+            elif backend in ("duckduckgo", "searxng", "ask-search"):
+                results = await _local_extract(safe_urls)
             else:
                 # ── Firecrawl extraction ──
                 # Determine requested formats for Firecrawl v2
@@ -1682,6 +1861,20 @@ async def web_extract_tool(
         return cleaned_result
             
     except Exception as e:
+        if safe_urls:
+            try:
+                logger.warning("Configured web extraction failed (%s); falling back to local direct fetch", e)
+                fallback_results = await _local_extract(safe_urls)
+                fallback_json = json.dumps({"results": fallback_results}, indent=2, ensure_ascii=False)
+                cleaned_fallback = clean_base64_images(fallback_json)
+                debug_call_data["error"] = f"primary backend failed; used local fallback: {e}"
+                debug_call_data["pages_extracted"] = sum(1 for r in fallback_results if not r.get("error"))
+                debug_call_data["final_response_size"] = len(cleaned_fallback)
+                _debug.log_call("web_extract_tool", debug_call_data)
+                _debug.save()
+                return cleaned_fallback
+            except Exception:
+                pass
         error_msg = f"Error extracting content: {str(e)}"
         logger.debug("%s", error_msg)
         
@@ -2126,14 +2319,16 @@ def check_web_api_key() -> bool:
     configured = _load_web_config().get("backend", "").lower().strip()
     if configured == "ask_search":
         configured = "ask-search"
-    if configured in ("exa", "parallel", "tavily", "searxng", "ask-search"):
+    if configured in ("ddg", "local"):
+        configured = "duckduckgo"
+    if configured in ("exa", "parallel", "tavily", "searxng", "ask-search", "duckduckgo"):
         return _is_backend_available(configured)
     if configured == "firecrawl":
         return _is_backend_available(configured) or any(
             _is_backend_available(backend)
-            for backend in ("searxng", "ask-search", "exa", "parallel", "tavily")
+            for backend in ("searxng", "ask-search", "exa", "parallel", "tavily", "duckduckgo")
         )
-    return any(_is_backend_available(backend) for backend in ("searxng", "ask-search", "exa", "parallel", "firecrawl", "tavily"))
+    return any(_is_backend_available(backend) for backend in ("searxng", "ask-search", "exa", "parallel", "firecrawl", "tavily", "duckduckgo"))
 
 
 def check_auxiliary_model() -> bool:

@@ -324,6 +324,13 @@ class TestBackendSelection:
         with patch("tools.web_tools._load_web_config", return_value={"backend": "Tavily"}):
             assert _get_backend() == "tavily"
 
+    @pytest.mark.parametrize("configured", ["duckduckgo", "ddg", "local", "DuckDuckGo"])
+    def test_config_duckduckgo_aliases(self, configured):
+        """DuckDuckGo/local aliases select the keyless local search backend."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={"backend": configured}):
+            assert _get_backend() == "duckduckgo"
+
     # ── Fallback (no web.backend in config) ───────────────────────────
 
     def test_fallback_parallel_only_key(self):
@@ -383,11 +390,11 @@ class TestBackendSelection:
              patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}):
             assert _get_backend() == "firecrawl"
 
-    def test_fallback_no_keys_defaults_to_firecrawl(self):
-        """No keys, no config → 'firecrawl' (will fail at client init)."""
+    def test_fallback_no_keys_defaults_to_duckduckgo(self):
+        """No keys, no config → keyless DuckDuckGo/local fallback."""
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={}):
-            assert _get_backend() == "firecrawl"
+            assert _get_backend() == "duckduckgo"
 
     def test_invalid_config_falls_through_to_fallback(self):
         """web.backend=invalid → ignored, uses key-based fallback."""
@@ -454,11 +461,8 @@ class TestWebSearchErrorHandling:
     def test_search_error_response_does_not_expose_diagnostics(self):
         import tools.web_tools
 
-        firecrawl_client = MagicMock()
-        firecrawl_client.search.side_effect = RuntimeError("boom")
-
-        with patch("tools.web_tools._get_backend", return_value="firecrawl"), \
-             patch("tools.web_tools._get_firecrawl_client", return_value=firecrawl_client), \
+        with patch("tools.web_tools._get_backend", return_value="duckduckgo"), \
+             patch("tools.web_tools._duckduckgo_search", side_effect=RuntimeError("boom")), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch.object(tools.web_tools._debug, "log_call") as mock_log_call, \
              patch.object(tools.web_tools._debug, "save"):
@@ -474,6 +478,26 @@ class TestWebSearchErrorHandling:
         assert "exception_type" not in result
         assert "exception_chain" not in result
         assert "traceback" not in result
+
+    def test_firecrawl_search_error_falls_back_to_duckduckgo(self):
+        import tools.web_tools
+
+        firecrawl_client = MagicMock()
+        firecrawl_client.search.side_effect = RuntimeError("boom")
+        fallback_payload = {"success": True, "provider": "duckduckgo", "data": {"web": []}}
+
+        with patch("tools.web_tools._get_backend", return_value="firecrawl"), \
+             patch("tools.web_tools._get_firecrawl_client", return_value=firecrawl_client), \
+             patch("tools.web_tools._duckduckgo_search", return_value=fallback_payload) as mock_ddg, \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch.object(tools.web_tools._debug, "log_call") as mock_log_call, \
+             patch.object(tools.web_tools._debug, "save"):
+            result = json.loads(tools.web_tools.web_search_tool("test query", limit=3))
+
+        assert result == fallback_payload
+        mock_ddg.assert_called_once_with("test query", 3)
+        debug_payload = mock_log_call.call_args.args[1]
+        assert debug_payload["error"] is None
 
 
 class TestCheckWebApiKey:
@@ -532,9 +556,15 @@ class TestCheckWebApiKey:
             from tools.web_tools import check_web_api_key
             assert check_web_api_key() is True
 
-    def test_no_keys_returns_false(self):
+    def test_no_keys_returns_true_for_duckduckgo_fallback(self):
         from tools.web_tools import check_web_api_key
-        assert check_web_api_key() is False
+        assert check_web_api_key() is True
+
+    @pytest.mark.parametrize("configured", ["duckduckgo", "ddg", "local"])
+    def test_configured_duckduckgo_backend_is_available_without_keys(self, configured):
+        from tools.web_tools import check_web_api_key
+        with patch("tools.web_tools._load_web_config", return_value={"backend": configured}):
+            assert check_web_api_key() is True
 
     def test_both_keys_returns_true(self):
         with patch.dict(os.environ, {
