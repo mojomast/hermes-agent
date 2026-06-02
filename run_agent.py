@@ -116,6 +116,7 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.prompt_budget import build_prompt_budget_record, emit_prompt_budget_warnings
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 
 
@@ -4425,6 +4426,9 @@ class AIAgent:
         #   7. Platform-specific formatting hint
 
         # Try SOUL.md as primary identity (unless context files are skipped)
+        _prompt_budget_memory_parts = []
+        _prompt_budget_user_profile_parts = []
+        _prompt_budget_context_file_parts = []
         _soul_loaded = False
         if not self.skip_context_files:
             _soul_content = load_soul_md()
@@ -4495,11 +4499,13 @@ class AIAgent:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
                 if mem_block:
                     prompt_parts.append(mem_block)
+                    _prompt_budget_memory_parts.append(mem_block)
             # USER.md is always included when enabled.
             if self._user_profile_enabled:
                 user_block = self._memory_store.format_for_system_prompt("user")
                 if user_block:
                     prompt_parts.append(user_block)
+                    _prompt_budget_user_profile_parts.append(user_block)
 
         # External memory provider system prompt block (additive to built-in)
         if self._memory_manager:
@@ -4507,6 +4513,7 @@ class AIAgent:
                 _ext_mem_block = self._memory_manager.build_system_prompt()
                 if _ext_mem_block:
                     prompt_parts.append(_ext_mem_block)
+                    _prompt_budget_memory_parts.append(_ext_mem_block)
             except Exception:
                 pass
 
@@ -4539,6 +4546,7 @@ class AIAgent:
                 cwd=_context_cwd, skip_soul=_soul_loaded)
             if context_files_prompt:
                 prompt_parts.append(context_files_prompt)
+                _prompt_budget_context_file_parts.append(context_files_prompt)
 
         from hermes_time import now as _hermes_now
         now = _hermes_now()
@@ -4573,7 +4581,14 @@ class AIAgent:
         if platform_key in PLATFORM_HINTS:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
 
-        return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
+        final_prompt = "\n\n".join(p.strip() for p in prompt_parts if p.strip())
+        self._prompt_budget_system_components = {
+            "system_prompt": final_prompt,
+            "memory": "\n\n".join(p.strip() for p in _prompt_budget_memory_parts if p and p.strip()),
+            "user_profile": "\n\n".join(p.strip() for p in _prompt_budget_user_profile_parts if p and p.strip()),
+            "context_files": "\n\n".join(p.strip() for p in _prompt_budget_context_file_parts if p and p.strip()),
+        }
+        return final_prompt
 
     # =========================================================================
     # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
@@ -9543,6 +9558,7 @@ class AIAgent:
                 # Continuing session — reuse the exact system prompt from
                 # the previous turn so the Anthropic cache prefix matches.
                 self._cached_system_prompt = stored_prompt
+                self._prompt_budget_system_components = {"system_prompt": stored_prompt}
             else:
                 # First turn of a new session — build from scratch.
                 self._cached_system_prompt = self._build_system_prompt(system_message)
@@ -9854,6 +9870,7 @@ class AIAgent:
                 )
 
             api_messages = []
+            current_api_user_idx = None
             for idx, msg in enumerate(messages):
                 api_msg = msg.copy()
 
@@ -9863,6 +9880,7 @@ class AIAgent:
                 # API-call-time only — the original message in `messages` is
                 # never mutated, so nothing leaks into session persistence.
                 if idx == current_turn_user_idx and msg.get("role") == "user":
+                    current_api_user_idx = len(api_messages)
                     _injections = []
                     if _ext_prefetch_cache:
                         _fenced = build_memory_context_block(_ext_prefetch_cache)
@@ -9911,6 +9929,8 @@ class AIAgent:
             # cache prefix.  The system prompt is reserved for Hermes internals.
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
+                if current_api_user_idx is not None:
+                    current_api_user_idx += 1
 
             # Inject ephemeral prefill messages right after the system prompt
             # but before conversation history. Same API-call-time-only pattern.
@@ -9918,6 +9938,8 @@ class AIAgent:
                 sys_offset = 1 if effective_system else 0
                 for idx, pfm in enumerate(self.prefill_messages):
                     api_messages.insert(sys_offset + idx, pfm.copy())
+                if current_api_user_idx is not None:
+                    current_api_user_idx += len(self.prefill_messages)
 
             # Apply Anthropic prompt caching for Claude models on native
             # Anthropic, OpenRouter, and third-party Anthropic-compatible
@@ -9977,6 +9999,28 @@ class AIAgent:
             # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
             # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
             _sanitize_messages_surrogates(api_messages)
+
+            if self._session_db and self.session_id:
+                try:
+                    _budget_components = dict(getattr(self, "_prompt_budget_system_components", {}) or {})
+                    if effective_system:
+                        _budget_components["system_prompt"] = effective_system
+                    _budget_record = build_prompt_budget_record(
+                        trace_id=None,
+                        session_id=self.session_id,
+                        turn_id=effective_task_id,
+                        api_messages=api_messages,
+                        tools=self.tools or [],
+                        system_components=_budget_components,
+                        current_user_message_index=current_api_user_idx,
+                        memory_injection=build_memory_context_block(_ext_prefetch_cache) if _ext_prefetch_cache else "",
+                        plugin_user_context=_plugin_user_context,
+                        available_output_budget=self.max_tokens,
+                    )
+                    self._session_db.record_prompt_budget(_budget_record)
+                    emit_prompt_budget_warnings(_budget_record)
+                except Exception as e:
+                    logger.debug("Session DB record_prompt_budget failed: %s", e)
 
             # Calculate approximate request size for logging
             total_chars = sum(len(str(msg)) for msg in api_messages)

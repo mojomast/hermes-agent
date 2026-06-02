@@ -21,6 +21,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, TypeVar
@@ -32,6 +33,29 @@ T = TypeVar("T")
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
 SCHEMA_VERSION = 8
+
+PROMPT_BUDGETS_SQL = """
+CREATE TABLE IF NOT EXISTS prompt_budgets (
+    budget_id TEXT PRIMARY KEY,
+    trace_id TEXT,
+    session_id TEXT,
+    turn_id TEXT,
+    timestamp REAL NOT NULL,
+    system_prompt_tokens INTEGER DEFAULT 0,
+    developer_prompt_tokens INTEGER DEFAULT 0,
+    tool_schema_tokens INTEGER DEFAULT 0,
+    memory_tokens INTEGER DEFAULT 0,
+    user_profile_tokens INTEGER DEFAULT 0,
+    conversation_history_tokens INTEGER DEFAULT 0,
+    context_file_tokens INTEGER DEFAULT 0,
+    tool_result_tokens INTEGER DEFAULT 0,
+    current_user_message_tokens INTEGER DEFAULT 0,
+    total_input_tokens INTEGER DEFAULT 0,
+    available_output_budget INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_budgets_session_time ON prompt_budgets(session_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_prompt_budgets_trace ON prompt_budgets(trace_id);
+"""
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -261,6 +285,9 @@ class SessionDB:
         cursor = self._conn.cursor()
 
         cursor.executescript(SCHEMA_SQL)
+        # Forward-only prompt budget telemetry. Additive, idempotent DDL;
+        # records token counts only (no prompts, tool args/results, or secrets).
+        cursor.executescript(PROMPT_BUDGETS_SQL)
 
         # Check schema version and run migrations
         cursor.execute("SELECT version FROM schema_version LIMIT 1")
@@ -568,6 +595,53 @@ class SessionDB:
         def _do(conn):
             conn.execute(sql, params)
         self._execute_write(_do)
+
+    def record_prompt_budget(self, budget_row: Dict[str, Any]) -> str:
+        """Persist prompt token breakdown telemetry.
+
+        The row must contain counts only. This method intentionally stores no
+        prompt text, message content, tool schemas, tool arguments/results, API
+        keys, headers, or provider request payloads.
+        """
+        budget_id = str(budget_row.get("budget_id") or uuid.uuid4())
+        timestamp = float(budget_row.get("timestamp") or time.time())
+
+        def _int(value, default=0):
+            if value is None:
+                return default
+            return int(value)
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO prompt_budgets (
+                       budget_id, trace_id, session_id, turn_id, timestamp,
+                       system_prompt_tokens, developer_prompt_tokens,
+                       tool_schema_tokens, memory_tokens, user_profile_tokens,
+                       conversation_history_tokens, context_file_tokens,
+                       tool_result_tokens, current_user_message_tokens,
+                       total_input_tokens, available_output_budget
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    budget_id,
+                    budget_row.get("trace_id"),
+                    budget_row.get("session_id"),
+                    budget_row.get("turn_id"),
+                    timestamp,
+                    _int(budget_row.get("system_prompt_tokens")),
+                    _int(budget_row.get("developer_prompt_tokens")),
+                    _int(budget_row.get("tool_schema_tokens")),
+                    _int(budget_row.get("memory_tokens")),
+                    _int(budget_row.get("user_profile_tokens")),
+                    _int(budget_row.get("conversation_history_tokens")),
+                    _int(budget_row.get("context_file_tokens")),
+                    _int(budget_row.get("tool_result_tokens")),
+                    _int(budget_row.get("current_user_message_tokens")),
+                    _int(budget_row.get("total_input_tokens")),
+                    None if budget_row.get("available_output_budget") is None else _int(budget_row.get("available_output_budget")),
+                ),
+            )
+        self._execute_write(_do)
+        return budget_id
 
     def ensure_session(
         self,
