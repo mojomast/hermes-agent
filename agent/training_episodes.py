@@ -42,6 +42,27 @@ RAW_CONTENT_KEYS = {
     "input",
     "env",
 }
+RAW_CONTENT_KEY_MARKERS = (
+    "result",
+    "output",
+    "prompt",
+    "message",
+    "content",
+    "stdout",
+    "stderr",
+    "body",
+    "payload",
+    "headers",
+    "args",
+    "arguments",
+    "command",
+    "input",
+    "env",
+    "response",
+    "transcript",
+    "completion",
+    "observation",
+)
 RAW_PAYLOAD_REDACTION = "[REDACTED_RAW_PAYLOAD]"
 GENERATED_ARTIFACT_PATTERNS = (
     ".jsonl", ".db", ".sqlite", ".sqlite3", ".npy", ".pt", ".pth",
@@ -125,33 +146,43 @@ def _raw_payload_digest(value: Any) -> Dict[str, Any]:
     }
 
 
+def _is_raw_content_key(key: str) -> bool:
+    """Return True for raw-payload fields, including common compound aliases."""
+    normalized = key.lower()
+    if normalized in RAW_CONTENT_KEYS:
+        return True
+    key_parts = [part for part in re.split(r"[^a-z0-9]+", normalized) if part]
+    return any(part in RAW_CONTENT_KEY_MARKERS for part in key_parts)
+
+
+def _minimize_value(value: Any) -> Any:
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    if isinstance(value, str):
+        if SECRET_RE.search(value):
+            return "[REDACTED]"
+        if len(value) > 160:
+            return {"truncated": True, "length": len(value), "sha256_prefix": hashlib.sha256(value.encode('utf-8', 'replace')).hexdigest()[:16]}
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_minimize_value(v) for v in list(value)[:10]]
+    if isinstance(value, dict):
+        return minimize_payload({str(a): b for a, b in list(value.items())[:10]})
+    return str(value)[:120]
+
+
 def minimize_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     """Return JSON-safe metadata with secrets and raw-content payloads stripped."""
     safe: Dict[str, Any] = {}
     for key, value in list(data.items())[:40]:
         k = str(key)
-        normalized_key = k.lower()
-        if normalized_key in RAW_CONTENT_KEYS:
+        if _is_raw_content_key(k):
             safe[k] = _raw_payload_digest(value)
             continue
         if SECRET_RE.search(k):
             safe[k] = "[REDACTED]"
             continue
-        if isinstance(value, (bool, int, float)) or value is None:
-            safe[k] = value
-        elif isinstance(value, str):
-            if SECRET_RE.search(value):
-                safe[k] = "[REDACTED]"
-            elif len(value) > 160:
-                safe[k] = {"truncated": True, "length": len(value), "sha256_prefix": hashlib.sha256(value.encode('utf-8', 'replace')).hexdigest()[:16]}
-            else:
-                safe[k] = value
-        elif isinstance(value, (list, tuple)):
-            safe[k] = [str(v)[:80] for v in value[:10]]
-        elif isinstance(value, dict):
-            safe[k] = minimize_payload({str(a): b for a, b in list(value.items())[:10]})
-        else:
-            safe[k] = str(value)[:120]
+        safe[k] = _minimize_value(value)
     return safe
 
 

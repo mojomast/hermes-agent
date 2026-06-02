@@ -188,6 +188,26 @@ def _js_var_decl_kind(line: str, match: re.Match[str]) -> str:
     return "variable"
 
 
+def _sanitize_js_diagnostic(raw_message: str) -> str:
+    """Keep parser diagnostics useful without including source excerpts."""
+    safe_lines: List[str] = []
+    for line in raw_message.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith((">", "^")):
+            continue
+        if re.search(r"\.[cm]?js:\d+", stripped):
+            safe_lines.append(stripped)
+            continue
+        if stripped.startswith("SyntaxError:") or stripped.startswith("Error:"):
+            safe_lines.append(stripped)
+            continue
+        if stripped.startswith("at "):
+            continue
+    if safe_lines:
+        return " | ".join(safe_lines)[:500]
+    return "JavaScript syntax check failed"
+
+
 def parse_js_like(path: Path, root: Path, include_context: bool = False) -> tuple[List[CodeSymbol], List[CodeReference], List[CodeDiagnostic]]:
     rel = str(path.relative_to(root))
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -219,7 +239,7 @@ def parse_js_like(path: Path, root: Path, include_context: bool = False) -> tupl
         try:
             proc = subprocess.run(["node", "--check", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
             if proc.returncode != 0:
-                diagnostics.append(CodeDiagnostic(path=rel, line=1, column=0, severity="error", message=(proc.stderr or proc.stdout).strip()[:500], source="node --check"))
+                diagnostics.append(CodeDiagnostic(path=rel, line=1, column=0, severity="error", message=_sanitize_js_diagnostic(proc.stderr or proc.stdout), source="node --check"))
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
     return symbols, refs, diagnostics

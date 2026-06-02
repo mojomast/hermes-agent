@@ -1,4 +1,5 @@
 import json
+import subprocess
 
 from agent.semantic_code_index import cache_path_for, get_diagnostics, go_to_definition, list_references, semantic_lookup
 
@@ -88,3 +89,33 @@ def test_reference_context_privacy_default_and_cache_safety(tmp_path):
     opt_in_refs = semantic_lookup(project, "references", query="SECRET_SNIPPET", include_context=True)
     assert any(secret_line in r.get("context", "") for r in opt_in_refs["references"])
     assert secret_line not in cache_path.read_text(encoding="utf-8")
+
+
+def test_javascript_diagnostics_omit_source_excerpts_by_default(tmp_path, monkeypatch):
+    project = tmp_path / "js-private"
+    project.mkdir()
+    private_literal = "PRIVATE_PATIENT_LAVENDER_OTTER"
+    (project / "broken.js").write_text(f"const secret = '{private_literal}'\nfunction nope( {{\n", encoding="utf-8")
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=1,
+            stdout="",
+            stderr=(
+                f"{project / 'broken.js'}:2\n"
+                f"function nope( {{ // {private_literal}\n"
+                "               ^\n"
+                "SyntaxError: Unexpected token '{'\n"
+                "    at internal/main/check_syntax:1:1\n"
+            ),
+        )
+
+    monkeypatch.setattr("agent.semantic_code_index.subprocess.run", fake_run)
+
+    diagnostics = get_diagnostics(project)
+    diagnostic_blob = json.dumps(diagnostics)
+
+    assert diagnostics["total"] == 1
+    assert "SyntaxError: Unexpected token" in diagnostics["diagnostics"][0]["message"]
+    assert private_literal not in diagnostic_blob

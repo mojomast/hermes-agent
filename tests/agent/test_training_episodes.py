@@ -44,6 +44,8 @@ def test_raw_content_keys_redact_non_secret_private_text():
     private_result = "private project note: launch codename velvet-mango"
     private_stdout = "stdout contained internal customer migration details"
     private_prompt = "prompt asked about a confidential family matter"
+    private_response = "assistant response included patient name lavender otter"
+    private_transcript = "call transcript included home address marmalade lane"
     trace = {
         "trace_id": "trace-raw-redaction",
         "session_id": "sess",
@@ -68,6 +70,8 @@ def test_raw_content_keys_redact_non_secret_private_text():
                     "result": private_result,
                     "stdout": private_stdout,
                     "nested": {"prompt": private_prompt},
+                    "tool_response": private_response,
+                    "chat_history_transcript": private_transcript,
                 }
             ),
         },
@@ -88,6 +92,58 @@ def test_raw_content_keys_redact_non_secret_private_text():
     assert private_result not in episode_blob
     assert private_stdout not in episode_blob
     assert private_prompt not in episode_blob
+    assert private_response not in episode_blob
+    assert private_transcript not in episode_blob
+
+
+def test_nested_list_metadata_redacts_raw_payloads_and_secrets():
+    private_prompt = "prompt asked for a confidential acquisition codename blue-raccoon"
+    secret_token = "sk-test-private-token-123456"
+    trace = {
+        "trace_id": "trace-list-redaction",
+        "session_id": "sess",
+        "turn_id": "turn",
+        "user_message_hash": "hash",
+        "start_time": 1.0,
+        "end_time": 2.0,
+        "total_wall_ms": 1000,
+        "total_model_calls": 1,
+        "status": "completed",
+    }
+    spans = [
+        {
+            "span_type": "tool_call",
+            "name": "execute_code",
+            "status": "completed",
+            "start_time": 1.0,
+            "end_time": 1.1,
+            "error_class": None,
+            "metadata_json": json.dumps(
+                {
+                    "events": [
+                        {"prompt": private_prompt},
+                        {"api_key": secret_token},
+                    ]
+                }
+            ),
+        },
+        {
+            "span_type": "final_answer",
+            "name": "turn.final_answer",
+            "status": "completed",
+            "start_time": 1.1,
+            "end_time": 2.0,
+            "error_class": None,
+            "metadata_json": json.dumps({"completed": True}),
+        },
+    ]
+
+    episode_blob = json.dumps(trace_to_episode(trace, spans).to_dict())
+
+    assert "[REDACTED_RAW_PAYLOAD]" in episode_blob
+    assert "[REDACTED]" in episode_blob
+    assert private_prompt not in episode_blob
+    assert secret_token not in episode_blob
 
 
 def test_failed_tool_call_lowers_reward_and_blocks_training(tmp_path):
