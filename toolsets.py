@@ -55,6 +55,8 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
+    # Self-improvement + semantic coding
+    "training_episodes", "semantic_code",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -185,6 +187,18 @@ TOOLSETS = {
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
         "tools": ["execute_code"],
+        "includes": []
+    },
+
+    "self_improvement": {
+        "description": "Trace-to-episode export, reward scoring, and self-improvement eval substrates",
+        "tools": ["training_episodes"],
+        "includes": []
+    },
+
+    "coding": {
+        "description": "IDE-grade semantic code index primitives: symbols, definitions, references, diagnostics",
+        "tools": ["semantic_code"],
         "includes": []
     },
     

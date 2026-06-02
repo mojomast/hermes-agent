@@ -588,6 +588,38 @@ async def get_status():
     }
 
 
+@app.get("/api/self-improvement/episodes")
+async def get_training_episode_summary(limit: int = 100):
+    """Dashboard-safe TrainingEpisode summary: counts/rewards only, no raw payloads."""
+    try:
+        from agent.training_episodes import episode_summary
+        return episode_summary(limit=max(1, min(int(limit), 1000)))
+    except FileNotFoundError:
+        return {"schema_version": "training_episode.v1", "episode_count": 0, "ready_for_training_count": 0, "recent_rewards": [], "avg_reward": 0.0, "conversion_latency_ms": 0}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/self-improvement/episodes/export")
+async def export_training_episodes(limit: int = 100, ready_only: bool = False):
+    """Export privacy-minimized TrainingEpisode JSONL under HERMES_HOME/exports."""
+    try:
+        from agent.training_episodes import default_episode_export_path, export_episodes_jsonl
+        return export_episodes_jsonl(default_episode_export_path(), limit=max(1, min(int(limit), 5000)), ready_only=bool(ready_only))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/coding/semantic-index")
+async def get_semantic_index(project_path: str, operation: str = "summary", query: str = "", kind: str = "", limit: int = 50, include_context: bool = False):
+    """Semantic coding primitive endpoint for dashboard/tool consumers."""
+    try:
+        from agent.semantic_code_index import semantic_lookup
+        return semantic_lookup(project_path=project_path, operation=operation, query=query, kind=(kind or None), limit=max(1, min(int(limit), 500)), include_context=include_context)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 # ---------------------------------------------------------------------------
 # Gateway + update actions (invoked from the Status page).
 #
