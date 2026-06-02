@@ -33,11 +33,19 @@ Pick the row that matches your goal:
 
 ## 1. Install Hermes Agent
 
-Run the one-line installer:
+Run the official upstream installer:
 
 ```bash
 # Linux / macOS / WSL2 / Android (Termux)
 curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+```
+
+Or install this fork from source:
+
+```bash
+git clone https://github.com/mojomast/hermes-agent.git
+cd hermes-agent
+./setup-hermes.sh
 ```
 
 :::tip Android / Termux

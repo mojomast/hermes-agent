@@ -39,9 +39,12 @@ We value contributions in this order:
 
 ### Clone and Install
 
+For this fork:
+
 ```bash
-git clone --recurse-submodules https://github.com/NousResearch/hermes-agent.git
+git clone https://github.com/mojomast/hermes-agent.git
 cd hermes-agent
+git remote add upstream https://github.com/NousResearch/hermes-agent.git
 
 # Create venv with Python 3.11
 uv venv venv --python 3.11
@@ -49,7 +52,6 @@ export VIRTUAL_ENV="$(pwd)/venv"
 
 # Install with all extras (messaging, cron, CLI menus, dev tools)
 uv pip install -e ".[all,dev]"
-uv pip install -e "./tinker-atropos"
 
 # Optional: browser tools
 npm install
@@ -63,7 +65,7 @@ cp cli-config.yaml.example ~/.hermes/config.yaml
 touch ~/.hermes/.env
 
 # Add at minimum an LLM provider key:
-echo 'OPENROUTER_API_KEY=sk-or-v1-your-key' >> ~/.hermes/.env
+echo 'OPENROUTER_API_KEY=***' >> ~/.hermes/.env
 ```
 
 ### Run

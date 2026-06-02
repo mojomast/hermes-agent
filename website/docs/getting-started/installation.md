@@ -6,7 +6,7 @@ description: "Install Hermes Agent on Linux, macOS, WSL2, or Android via Termux"
 
 # Installation
 
-Get Hermes Agent up and running in under two minutes with the one-line installer.
+Get Hermes Agent up and running in under two minutes with the one-line installer, or clone this fork directly from GitHub.
 
 ## Quick Install
 
@@ -15,6 +15,17 @@ Get Hermes Agent up and running in under two minutes with the one-line installer
 ```bash
 curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
 ```
+
+:::note Installing this fork
+The one-line installer above is the official upstream Nous Research installer. To install the `mojomast/hermes-agent` fork from source:
+
+```bash
+git clone https://github.com/mojomast/hermes-agent.git
+cd hermes-agent
+./setup-hermes.sh
+```
+
+:::
 
 ### Android / Termux
 
