@@ -23,6 +23,7 @@ from hermes_constants import get_hermes_home
 from hermes_state import DEFAULT_DB_PATH
 
 SCHEMA_VERSION = "training_episode.v1"
+REPLAY_EVAL_SCHEMA_VERSION = "training_episode_replay_eval.v1"
 MAX_METADATA_CHARS = 2_000
 SECRET_RE = re.compile(r"(?i)(api[_-]?key|token|secret|password|authorization|bearer|sk-[a-z0-9])")
 RAW_CONTENT_KEYS = {
@@ -147,12 +148,15 @@ def _raw_payload_digest(value: Any) -> Dict[str, Any]:
 
 
 def _is_raw_content_key(key: str) -> bool:
-    """Return True for raw-payload fields, including common compound aliases."""
+    """Return True for raw-payload fields, including compound/camel aliases."""
     normalized = key.lower()
     if normalized in RAW_CONTENT_KEYS:
         return True
     key_parts = [part for part in re.split(r"[^a-z0-9]+", normalized) if part]
-    return any(part in RAW_CONTENT_KEY_MARKERS for part in key_parts)
+    if any(part in RAW_CONTENT_KEY_MARKERS for part in key_parts):
+        return True
+    compacted = "".join(key_parts) or normalized
+    return any(marker in compacted for marker in RAW_CONTENT_KEY_MARKERS)
 
 
 def _minimize_value(value: Any) -> Any:
@@ -286,6 +290,146 @@ def iter_episodes(db_path: Path = DEFAULT_DB_PATH, limit: int = 100, min_reward:
             if ready_only and not episode.ready_for_training:
                 continue
             yield episode
+
+
+def _is_raw_payload_descriptor(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("redacted") == RAW_PAYLOAD_REDACTION
+        and isinstance(value.get("length"), int)
+        and isinstance(value.get("sha256_prefix"), str)
+        and len(value.get("sha256_prefix", "")) >= 8
+    )
+
+
+def _walk_metadata_raw_keys(value: Any, path: str = "metadata") -> Iterable[tuple[str, Any]]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if _is_raw_content_key(str(key)):
+                yield child_path, child
+            yield from _walk_metadata_raw_keys(child, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value[:50]):
+            yield from _walk_metadata_raw_keys(child, f"{path}[{index}]")
+
+
+def privacy_findings_for_episode(episode: TrainingEpisode | Dict[str, Any], *, forbidden_substrings: Iterable[str] = ()) -> List[Dict[str, Any]]:
+    """Return privacy regression findings for a minimized TrainingEpisode.
+
+    Findings never echo raw forbidden content; canaries are represented by hash
+    prefixes so eval output remains safe to store/share.
+    """
+    data = episode.to_dict() if isinstance(episode, TrainingEpisode) else dict(episode)
+    findings: List[Dict[str, Any]] = []
+    blob = json.dumps(data, sort_keys=True, default=str)
+
+    if data.get("privacy", {}).get("raw_content_exported") is True:
+        findings.append({"code": "raw_content_exported_true", "message": "Episode privacy metadata reports raw content export."})
+
+    for substring in forbidden_substrings:
+        if substring and substring in blob:
+            digest = hashlib.sha256(str(substring).encode("utf-8", "replace")).hexdigest()[:16]
+            findings.append({"code": "forbidden_substring_present", "message": "Forbidden substring appeared in episode JSON.", "substring_sha256_prefix": digest})
+
+    for step_index, step in enumerate(data.get("steps", [])):
+        metadata = step.get("metadata", {}) if isinstance(step, dict) else {}
+        for path, value in _walk_metadata_raw_keys(metadata, f"steps[{step_index}].metadata"):
+            if not _is_raw_payload_descriptor(value):
+                findings.append({"code": "raw_payload_key_without_digest", "message": "Raw-payload metadata key did not contain a redacted digest descriptor.", "path": path})
+
+    return findings
+
+
+def replay_episode_eval(episode: TrainingEpisode, *, min_reward: float = 1.0, require_ready: bool = True, forbidden_substrings: Iterable[str] = ()) -> Dict[str, Any]:
+    """Deterministically evaluate one minimized TrainingEpisode projection."""
+    privacy_findings = privacy_findings_for_episode(episode, forbidden_substrings=forbidden_substrings)
+    reasons: List[str] = []
+    if episode.reward < min_reward:
+        reasons.append("reward_below_min")
+    if require_ready and not episode.ready_for_training:
+        reasons.append("not_ready_for_training")
+    if not episode.steps:
+        reasons.append("no_steps")
+    if not any(sig.name == "has_final_answer" and bool(sig.value) for sig in episode.outcome_signals):
+        reasons.append("missing_final_answer_signal")
+    if privacy_findings:
+        reasons.append("privacy_findings_present")
+
+    return {
+        "episode_id": episode.episode_id,
+        "trace_id": episode.trace_id,
+        "trace_status": episode.trace_status,
+        "ready_for_training": episode.ready_for_training,
+        "reward": episode.reward,
+        "step_count": len(episode.steps),
+        "outcome_signal_count": len(episode.outcome_signals),
+        "passed": not reasons,
+        "reasons": reasons,
+        "privacy_finding_count": len(privacy_findings),
+    }
+
+
+def replay_eval_episodes(
+    db_path: Path = DEFAULT_DB_PATH,
+    *,
+    limit: int = 100,
+    ready_only: bool = False,
+    min_reward: float = 1.0,
+    require_ready: bool = True,
+    include_episodes: bool = False,
+    max_failures: int = 20,
+    forbidden_substrings: Iterable[str] = (),
+) -> Dict[str, Any]:
+    """Run deterministic replay/eval over recent TrainingEpisode projections."""
+    start = time.perf_counter()
+    episodes = list(iter_episodes(db_path=db_path, limit=limit, ready_only=ready_only))
+    rows = [replay_episode_eval(e, min_reward=min_reward, require_ready=require_ready, forbidden_substrings=forbidden_substrings) for e in episodes]
+    rewards = [e.reward for e in episodes]
+    privacy_findings: List[Dict[str, Any]] = []
+    outcome_signal_totals: Dict[str, float] = {}
+    for episode in episodes:
+        privacy_findings.extend(privacy_findings_for_episode(episode, forbidden_substrings=forbidden_substrings))
+        for signal in episode.outcome_signals:
+            value = signal.value
+            if isinstance(value, bool):
+                numeric = 1.0 if value else 0.0
+            elif isinstance(value, (int, float)):
+                numeric = float(value)
+            else:
+                numeric = 1.0 if value else 0.0
+            outcome_signal_totals[signal.name] = outcome_signal_totals.get(signal.name, 0.0) + numeric
+
+    failed_rows = [row for row in rows if not row["passed"]]
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    result: Dict[str, Any] = {
+        "schema_version": REPLAY_EVAL_SCHEMA_VERSION,
+        "ok": not failed_rows and not privacy_findings,
+        "db_path": str(db_path),
+        "limit": int(limit),
+        "ready_only": bool(ready_only),
+        "thresholds": {"min_reward": min_reward, "require_ready": require_ready},
+        "episode_count": len(episodes),
+        "evaluated_count": len(rows),
+        "passed_count": len(rows) - len(failed_rows),
+        "failed_count": len(failed_rows),
+        "ready_for_training_count": sum(1 for e in episodes if e.ready_for_training),
+        "avg_reward": (sum(rewards) / len(rewards) if rewards else 0.0),
+        "min_observed_reward": (min(rewards) if rewards else 0.0),
+        "max_observed_reward": (max(rewards) if rewards else 0.0),
+        "outcome_signal_totals": outcome_signal_totals,
+        "privacy": {
+            "raw_content_exported": False,
+            "checked_episode_count": len(episodes),
+            "finding_count": len(privacy_findings),
+            "findings": privacy_findings[:max_failures],
+        },
+        "failures": failed_rows[:max_failures],
+        "elapsed_ms": elapsed_ms,
+    }
+    if include_episodes:
+        result["episodes"] = rows
+    return result
 
 
 def export_episodes_jsonl(output_path: Path, db_path: Path = DEFAULT_DB_PATH, limit: int = 100, ready_only: bool = False) -> Dict[str, Any]:

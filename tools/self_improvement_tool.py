@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from agent.semantic_code_index import semantic_lookup
-from agent.training_episodes import default_episode_export_path, episode_summary, export_episodes_jsonl, iter_episodes
+from agent.training_episodes import default_episode_export_path, episode_summary, export_episodes_jsonl, iter_episodes, replay_eval_episodes
 from hermes_state import DEFAULT_DB_PATH
 from tools.registry import registry, tool_error
 
@@ -26,13 +26,16 @@ TRAINING_EPISODES_SCHEMA = {
             "output_path": {"type": "string", "description": "JSONL export path. Defaults to ~/.hermes/exports/training_episodes.jsonl."},
             "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 5000},
             "ready_only": {"type": "boolean", "default": False},
+            "min_reward": {"type": "number", "default": 1.0, "description": "Minimum acceptable reward for replay_eval."},
+            "require_ready": {"type": "boolean", "default": True, "description": "Fail replay_eval rows that are not ready_for_training."},
+            "include_episodes": {"type": "boolean", "default": False, "description": "Include compact per-episode replay/eval rows."},
         },
         "required": ["operation"],
     },
 }
 
 
-def training_episodes(operation: str, db_path: str = "", output_path: str = "", limit: int = 100, ready_only: bool = False) -> str:
+def training_episodes(operation: str, db_path: str = "", output_path: str = "", limit: int = 100, ready_only: bool = False, min_reward: float = 1.0, require_ready: bool = True, include_episodes: bool = False) -> str:
     try:
         db = Path(db_path).expanduser() if db_path else DEFAULT_DB_PATH
         if operation == "summary":
@@ -44,15 +47,16 @@ def training_episodes(operation: str, db_path: str = "", output_path: str = "", 
             episodes = [e.to_dict() for e in iter_episodes(db_path=db, limit=min(limit, 10), ready_only=ready_only)]
             return _json({"success": True, "data": {"episodes": episodes, "count": len(episodes)}})
         if operation == "replay_eval":
-            episodes = list(iter_episodes(db_path=db, limit=limit, ready_only=ready_only))
             return _json({
                 "success": True,
-                "data": {
-                    "episode_count": len(episodes),
-                    "ready_for_training_count": sum(1 for e in episodes if e.ready_for_training),
-                    "mean_reward": (sum(e.reward for e in episodes) / len(episodes) if episodes else 0.0),
-                    "extension_seam": "Feed TrainingEpisode JSONL into ART/Agent-Lightning trainer or offline policy evaluator.",
-                },
+                "data": replay_eval_episodes(
+                    db_path=db,
+                    limit=limit,
+                    ready_only=ready_only,
+                    min_reward=min_reward,
+                    require_ready=require_ready,
+                    include_episodes=include_episodes,
+                ),
             })
         return tool_error(f"unsupported operation: {operation}")
     except Exception as exc:
@@ -96,6 +100,9 @@ registry.register(
         output_path=args.get("output_path", ""),
         limit=int(args.get("limit") or 100),
         ready_only=bool(args.get("ready_only") or False),
+        min_reward=float(args.get("min_reward") if args.get("min_reward") is not None else 1.0),
+        require_ready=bool(args.get("require_ready") if args.get("require_ready") is not None else True),
+        include_episodes=bool(args.get("include_episodes") or False),
     ),
     description="Trace-to-RL TrainingEpisode projection/export tool",
 )
