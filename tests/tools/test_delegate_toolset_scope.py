@@ -9,7 +9,7 @@ arbitrary toolsets.
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
-from tools.delegate_tool import _strip_blocked_tools
+from tools.delegate_tool import _narrow_child_toolsets, _strip_blocked_tools
 
 
 class TestToolsetIntersection:
@@ -19,10 +19,12 @@ class TestToolsetIntersection:
         """LLM requests toolsets parent doesn't have — extras are dropped."""
         parent = SimpleNamespace(enabled_toolsets=["terminal", "file"])
 
-        # Simulate the intersection logic from _build_child_agent
-        parent_toolsets = set(parent.enabled_toolsets)
         requested = ["terminal", "file", "web", "browser", "rl"]
-        scoped = [t for t in requested if t in parent_toolsets]
+        scoped = _narrow_child_toolsets(
+            requested,
+            parent_toolsets=set(parent.enabled_toolsets),
+            parent_enabled=parent.enabled_toolsets,
+        )
 
         assert sorted(scoped) == ["file", "terminal"]
         assert "web" not in scoped
@@ -33,16 +35,23 @@ class TestToolsetIntersection:
         """LLM requests subset of parent tools — all pass through."""
         parent = SimpleNamespace(enabled_toolsets=["terminal", "file", "web", "browser"])
 
-        parent_toolsets = set(parent.enabled_toolsets)
         requested = ["terminal", "web"]
-        scoped = [t for t in requested if t in parent_toolsets]
+        scoped = _narrow_child_toolsets(
+            requested,
+            parent_toolsets=set(parent.enabled_toolsets),
+            parent_enabled=parent.enabled_toolsets,
+        )
 
         assert sorted(scoped) == ["terminal", "web"]
 
     def test_no_toolsets_requested_inherits_parent(self):
         """When toolsets is None/empty, child inherits parent's set."""
         parent_toolsets = ["terminal", "file", "web"]
-        child = _strip_blocked_tools(parent_toolsets)
+        child = _narrow_child_toolsets(
+            None,
+            parent_toolsets=set(parent_toolsets),
+            parent_enabled=parent_toolsets,
+        )
         assert "terminal" in child
         assert "file" in child
         assert "web" in child
@@ -59,8 +68,52 @@ class TestToolsetIntersection:
         """If parent has no overlap with requested, child gets nothing extra."""
         parent = SimpleNamespace(enabled_toolsets=["terminal"])
 
-        parent_toolsets = set(parent.enabled_toolsets)
         requested = ["web", "browser"]
-        scoped = [t for t in requested if t in parent_toolsets]
+        scoped = _narrow_child_toolsets(
+            requested,
+            parent_toolsets=set(parent.enabled_toolsets),
+            parent_enabled=parent.enabled_toolsets,
+        )
 
         assert scoped == []
+
+    def test_empty_requested_toolsets_inherits_parent(self):
+        """Empty requested toolset lists are treated like omitted toolsets."""
+        child = _narrow_child_toolsets(
+            [],
+            parent_toolsets={"terminal", "file", "web"},
+            parent_enabled=["terminal", "file", "web"],
+        )
+
+        assert sorted(child) == ["file", "terminal", "web"]
+
+    def test_parent_enabled_none_uses_derived_parent_toolsets(self):
+        """Parents with all toolsets enabled use the derived effective scope."""
+        child = _narrow_child_toolsets(
+            None,
+            parent_toolsets={"terminal", "file"},
+            parent_enabled=None,
+        )
+
+        assert sorted(child) == ["file", "terminal"]
+
+    def test_preserve_mcp_toolsets_when_requested(self):
+        """Narrowed children retain parent MCP toolsets when MCP inheritance is enabled."""
+        child = _narrow_child_toolsets(
+            ["terminal"],
+            parent_toolsets={"terminal", "mcp-becomussy"},
+            parent_enabled=["terminal", "mcp-becomussy"],
+            inherit_mcp_toolsets=True,
+        )
+
+        assert child == ["terminal", "mcp-becomussy"]
+
+    def test_disable_mcp_preservation_keeps_requested_scope_only(self):
+        child = _narrow_child_toolsets(
+            ["terminal"],
+            parent_toolsets={"terminal", "mcp-becomussy"},
+            parent_enabled=["terminal", "mcp-becomussy"],
+            inherit_mcp_toolsets=False,
+        )
+
+        assert child == ["terminal"]

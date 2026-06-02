@@ -579,6 +579,40 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
+def _narrow_child_toolsets(
+    requested_toolsets: Optional[List[str]],
+    *,
+    parent_toolsets: set[str],
+    parent_enabled: Optional[List[str]] = None,
+    inherit_mcp_toolsets: Optional[bool] = None,
+) -> List[str]:
+    """Return the child toolsets allowed by the parent's current scope.
+
+    This centralises the delegation safety/efficiency rule: a child may only
+    receive explicitly requested toolsets that the parent already has, or inherit
+    the parent's effective scope when no explicit request is provided.  Blocked
+    toolsets are stripped at the end so leaf children cannot regain delegation,
+    shared memory mutation, or clarify/user-interaction capabilities.
+    """
+    if requested_toolsets:
+        child_toolsets = [t for t in requested_toolsets if t in parent_toolsets]
+        should_inherit_mcp = (
+            _get_inherit_mcp_toolsets()
+            if inherit_mcp_toolsets is None
+            else inherit_mcp_toolsets
+        )
+        if should_inherit_mcp:
+            child_toolsets = _preserve_parent_mcp_toolsets(child_toolsets, parent_toolsets)
+    elif parent_enabled is not None:
+        child_toolsets = list(parent_enabled)
+    elif parent_toolsets:
+        child_toolsets = sorted(parent_toolsets)
+    else:
+        child_toolsets = list(DEFAULT_TOOLSETS)
+
+    return _strip_blocked_tools(child_toolsets)
+
+
 def _build_child_progress_callback(
     task_index: int,
     goal: str,
@@ -841,20 +875,11 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
-        # Intersect with parent — subagent must not gain tools the parent lacks
-        child_toolsets = [t for t in toolsets if t in parent_toolsets]
-        if _get_inherit_mcp_toolsets():
-            child_toolsets = _preserve_parent_mcp_toolsets(
-                child_toolsets, parent_toolsets
-            )
-        child_toolsets = _strip_blocked_tools(child_toolsets)
-    elif parent_agent and parent_enabled is not None:
-        child_toolsets = _strip_blocked_tools(parent_enabled)
-    elif parent_toolsets:
-        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
-    else:
-        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
+    child_toolsets = _narrow_child_toolsets(
+        toolsets,
+        parent_toolsets=parent_toolsets,
+        parent_enabled=parent_enabled if parent_agent else None,
+    )
 
     # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
     # removed.  The re-add is unconditional on parent-toolset membership because
