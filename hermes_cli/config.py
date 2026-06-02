@@ -767,16 +767,16 @@ DEFAULT_CONFIG = {
     "context": {
         "engine": "compressor",
         # Prompt assembly mode. "lean" is default for token throughput: cap
-        # memory injection and use compact skills retrieval. Set to "full" for
+        # memory injection and use lazy skills retrieval. Set to "full" for
         # legacy/autonomous runs that truly need every skill listed up front.
         # Override per process with HERMES_CONTEXT_MODE.
         "prompt_mode": "lean",
         # Explicit prompt caps override mode defaults. Empty/None = mode default.
         "memory_inject_char_limit": None,
         "user_profile_inject_char_limit": None,
-        # "full" injects the full skill inventory; "compact" injects only
-        # retrieval instructions/category counts; "off" omits skill guidance.
-        "skills_index_mode": "compact",
+        # "lazy" injects retrieval instructions only; "compact" adds category counts;
+        # "full" injects the full skill inventory; "off" omits skill guidance.
+        "skills_index_mode": "lazy",
     },
 
     # Persistent memory -- bounded curated memory injected into system prompt

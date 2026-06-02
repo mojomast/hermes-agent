@@ -621,9 +621,9 @@ def _skill_should_show(
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
-    index_mode: str = "full",
+    index_mode: str = "lazy",
 ) -> str:
-    """Build a compact skill index for the system prompt.
+    """Build lazy skill guidance or an optional skill index for the system prompt.
 
     Two-layer cache:
       1. In-process LRU dict keyed by (skills_dir, tools, toolsets)
@@ -637,15 +637,25 @@ def build_skills_system_prompt(
     are read-only — they appear in the index but new skills are always created
     in the local dir.  Local skills take precedence when names collide.
     """
-    skills_dir = get_skills_dir()
-    external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
-    mode = (index_mode or "full").strip().lower()
-    if mode not in {"full", "compact", "off"}:
-        mode = "full"
+    mode = (index_mode or "lazy").strip().lower()
+    if mode not in {"full", "compact", "lazy", "off"}:
+        mode = "lazy"
 
     if mode == "off":
         return ""
 
+    if mode == "lazy":
+        return (
+            "## Skills (lazy-loaded)\n"
+            "Skills are available through tools, but the inventory is not injected to save context. "
+            "When a task may need specialized procedure, call skills_list (optionally with category) "
+            "to discover candidates, then skill_view(name) for the relevant skill before acting. "
+            "Use skill_manage to create or patch skills when you discover reusable workflows or outdated instructions. "
+            "Only skip skill retrieval when the task is trivial or no category is relevant."
+        )
+
+    skills_dir = get_skills_dir()
+    external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
     if not skills_dir.exists() and not external_dirs:
         return ""
 

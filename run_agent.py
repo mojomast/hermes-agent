@@ -1581,54 +1581,59 @@ class AIAgent:
         self._memory_flush_min_turns = 6
         self._turns_since_memory = 0
         self._iters_since_skill = 0
-        self._context_prompt_mode = "full"
-        self._skills_index_mode = "full"
+        self._context_prompt_mode = "lean"
+        self._skills_index_mode = "lazy"
         self._memory_inject_char_limit = None
         self._user_inject_char_limit = None
+
+        def _optional_int(value, default=None):
+            if value in (None, ""):
+                return default
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return default
+            return parsed if parsed > 0 else default
+
+        try:
+            context_config = _agent_cfg.get("context", {}) or {}
+            context_mode = (
+                os.environ.get("HERMES_CONTEXT_MODE")
+                or context_config.get("prompt_mode")
+                or "lean"
+            )
+            context_mode = str(context_mode).strip().lower()
+            if context_mode not in {"full", "balanced", "lean"}:
+                context_mode = "lean"
+
+            mode_memory_caps = {
+                "full": (None, None),
+                "balanced": (6000, 6000),
+                "lean": (3000, 4000),
+            }
+            default_memory_cap, default_user_cap = mode_memory_caps[context_mode]
+            self._context_prompt_mode = context_mode
+            self._skills_index_mode = str(
+                os.environ.get("HERMES_SKILLS_INDEX_MODE")
+                or context_config.get("skills_index_mode")
+                or "lazy"
+            ).strip().lower()
+            self._memory_inject_char_limit = _optional_int(
+                os.environ.get("HERMES_MEMORY_INJECT_CHAR_LIMIT")
+                or context_config.get("memory_inject_char_limit"),
+                default_memory_cap,
+            )
+            self._user_inject_char_limit = _optional_int(
+                os.environ.get("HERMES_USER_PROFILE_INJECT_CHAR_LIMIT")
+                or context_config.get("user_profile_inject_char_limit"),
+                default_user_cap,
+            )
+        except Exception:
+            pass  # Context prompt controls are optional -- keep lean/lazy defaults
+
         if not skip_memory:
             try:
                 mem_config = _agent_cfg.get("memory", {})
-                context_config = _agent_cfg.get("context", {}) or {}
-                context_mode = (
-                    os.environ.get("HERMES_CONTEXT_MODE")
-                    or context_config.get("prompt_mode")
-                    or "full"
-                )
-                context_mode = str(context_mode).strip().lower()
-                if context_mode not in {"full", "balanced", "lean"}:
-                    context_mode = "full"
-
-                def _optional_int(value, default=None):
-                    if value in (None, ""):
-                        return default
-                    try:
-                        parsed = int(value)
-                    except (TypeError, ValueError):
-                        return default
-                    return parsed if parsed > 0 else default
-
-                mode_memory_caps = {
-                    "full": (None, None),
-                    "balanced": (6000, 6000),
-                    "lean": (3000, 4000),
-                }
-                default_memory_cap, default_user_cap = mode_memory_caps[context_mode]
-                self._context_prompt_mode = context_mode
-                self._skills_index_mode = str(
-                    os.environ.get("HERMES_SKILLS_INDEX_MODE")
-                    or context_config.get("skills_index_mode")
-                    or ("compact" if context_mode in {"lean", "balanced"} else "full")
-                ).strip().lower()
-                self._memory_inject_char_limit = _optional_int(
-                    os.environ.get("HERMES_MEMORY_INJECT_CHAR_LIMIT")
-                    or context_config.get("memory_inject_char_limit"),
-                    default_memory_cap,
-                )
-                self._user_inject_char_limit = _optional_int(
-                    os.environ.get("HERMES_USER_PROFILE_INJECT_CHAR_LIMIT")
-                    or context_config.get("user_profile_inject_char_limit"),
-                    default_user_cap,
-                )
                 self._memory_enabled = mem_config.get("memory_enabled", False)
                 self._user_profile_enabled = mem_config.get("user_profile_enabled", False)
                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))

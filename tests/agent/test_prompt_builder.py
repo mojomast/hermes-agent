@@ -251,8 +251,41 @@ class TestBuildSkillsSystemPrompt:
 
     def test_empty_when_no_skills_dir(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        result = build_skills_system_prompt()
+        result = build_skills_system_prompt(index_mode="full")
         assert result == ""
+
+    def test_lazy_mode_returns_static_retrieval_prompt_without_inventory(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+
+        result = build_skills_system_prompt(index_mode="lazy")
+
+        assert "Skills (lazy-loaded)" in result
+        assert "skills_list" in result
+        assert "skill_view" in result
+        assert "skill_manage" in result
+        assert "python-debug" not in result
+        assert "Debug Python scripts" not in result
+        assert "Available skill categories" not in result
+        assert "available_skills" not in result
+
+    def test_invalid_index_mode_falls_back_to_lazy(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+
+        result = build_skills_system_prompt(index_mode="surprise")
+
+        assert "Skills (lazy-loaded)" in result
+        assert "python-debug" not in result
+        assert "available_skills" not in result
 
     def test_builds_index_with_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -261,7 +294,7 @@ class TestBuildSkillsSystemPrompt:
         (skills_dir / "SKILL.md").write_text(
             "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
         )
-        result = build_skills_system_prompt()
+        result = build_skills_system_prompt(index_mode="full")
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
@@ -290,7 +323,7 @@ class TestBuildSkillsSystemPrompt:
             d = cat_dir / subdir
             d.mkdir(parents=True, exist_ok=True)
             (d / "SKILL.md").write_text("---\ndescription: Search stuff\n---\n")
-        result = build_skills_system_prompt()
+        result = build_skills_system_prompt(index_mode="full")
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
@@ -318,7 +351,7 @@ class TestBuildSkillsSystemPrompt:
 
         with patch("agent.skill_utils.sys") as mock_sys:
             mock_sys.platform = "linux"
-            result = build_skills_system_prompt()
+            result = build_skills_system_prompt(index_mode="full")
 
         assert "web-search" in result
         assert "imessage" not in result
@@ -337,7 +370,7 @@ class TestBuildSkillsSystemPrompt:
 
         with patch("agent.skill_utils.sys") as mock_sys:
             mock_sys.platform = "darwin"
-            result = build_skills_system_prompt()
+            result = build_skills_system_prompt(index_mode="full")
 
         assert "imessage" in result
         assert "Send iMessages" in result
@@ -366,7 +399,7 @@ class TestBuildSkillsSystemPrompt:
             "agent.prompt_builder.get_disabled_skill_names",
             return_value={"old-tool"},
         ):
-            result = build_skills_system_prompt()
+            result = build_skills_system_prompt(index_mode="full")
 
         assert "web-search" in result
         assert "old-tool" not in result
@@ -379,14 +412,14 @@ class TestBuildSkillsSystemPrompt:
             "---\nname: cached-skill\ndescription: Cached skill\n---\n"
         )
 
-        first = build_skills_system_prompt()
+        first = build_skills_system_prompt(index_mode="full")
         assert "cached-skill" in first
 
         (tmp_path / "config.yaml").write_text(
             "skills:\n  disabled: [cached-skill]\n"
         )
 
-        second = build_skills_system_prompt()
+        second = build_skills_system_prompt(index_mode="full")
         assert "cached-skill" not in second
 
     def test_includes_setup_needed_skills(self, monkeypatch, tmp_path):
@@ -407,7 +440,7 @@ class TestBuildSkillsSystemPrompt:
             "---\nname: free-skill\ndescription: No prereqs\n---\n"
         )
 
-        result = build_skills_system_prompt()
+        result = build_skills_system_prompt(index_mode="full")
         assert "free-skill" in result
         assert "gated-skill" in result
 
@@ -424,7 +457,7 @@ class TestBuildSkillsSystemPrompt:
             "prerequisites:\n  env_vars: [MY_API_KEY]\n---\n"
         )
 
-        result = build_skills_system_prompt()
+        result = build_skills_system_prompt(index_mode="full")
         assert "ready-skill" in result
 
     def test_non_local_backend_keeps_skill_visible_without_probe(
@@ -442,7 +475,7 @@ class TestBuildSkillsSystemPrompt:
             "prerequisites:\n  env_vars: [BACKEND_ONLY_KEY]\n---\n"
         )
 
-        result = build_skills_system_prompt()
+        result = build_skills_system_prompt(index_mode="full")
         assert "backend-skill" in result
 
 
@@ -938,6 +971,7 @@ class TestBuildSkillsSystemPromptConditional:
             "---\nname: duckduckgo\ndescription: Free web search\nmetadata:\n  hermes:\n    fallback_for_toolsets: [web]\n---\n"
         )
         result = build_skills_system_prompt(
+            index_mode="full",
             available_tools=set(),
             available_toolsets={"web"},
         )
@@ -951,6 +985,7 @@ class TestBuildSkillsSystemPromptConditional:
             "---\nname: duckduckgo\ndescription: Free web search\nmetadata:\n  hermes:\n    fallback_for_toolsets: [web]\n---\n"
         )
         result = build_skills_system_prompt(
+            index_mode="full",
             available_tools=set(),
             available_toolsets=set(),
         )
@@ -964,6 +999,7 @@ class TestBuildSkillsSystemPromptConditional:
             "---\nname: openhue\ndescription: Hue lights\nmetadata:\n  hermes:\n    requires_toolsets: [terminal]\n---\n"
         )
         result = build_skills_system_prompt(
+            index_mode="full",
             available_tools=set(),
             available_toolsets=set(),
         )
@@ -977,6 +1013,7 @@ class TestBuildSkillsSystemPromptConditional:
             "---\nname: openhue\ndescription: Hue lights\nmetadata:\n  hermes:\n    requires_toolsets: [terminal]\n---\n"
         )
         result = build_skills_system_prompt(
+            index_mode="full",
             available_tools=set(),
             available_toolsets={"terminal"},
         )
@@ -990,6 +1027,7 @@ class TestBuildSkillsSystemPromptConditional:
             "---\nname: notes\ndescription: Take notes\n---\n"
         )
         result = build_skills_system_prompt(
+            index_mode="full",
             available_tools=set(),
             available_toolsets=set(),
         )
@@ -1003,7 +1041,7 @@ class TestBuildSkillsSystemPromptConditional:
         (skill_dir / "SKILL.md").write_text(
             "---\nname: duckduckgo\ndescription: Free web search\nmetadata:\n  hermes:\n    fallback_for_toolsets: [web]\n---\n"
         )
-        result = build_skills_system_prompt()
+        result = build_skills_system_prompt(index_mode="full")
         assert "duckduckgo" in result
 
     def test_null_metadata_does_not_crash(self, monkeypatch, tmp_path):
@@ -1016,6 +1054,7 @@ class TestBuildSkillsSystemPromptConditional:
             "---\nname: safe-skill\ndescription: Survives null metadata\nmetadata:\n---\n"
         )
         result = build_skills_system_prompt(
+            index_mode="full",
             available_tools=set(),
             available_toolsets=set(),
         )
@@ -1030,6 +1069,7 @@ class TestBuildSkillsSystemPromptConditional:
             "---\nname: nested-null\ndescription: Null hermes key\nmetadata:\n  hermes:\n---\n"
         )
         result = build_skills_system_prompt(
+            index_mode="full",
             available_tools=set(),
             available_toolsets=set(),
         )
