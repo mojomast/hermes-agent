@@ -66,7 +66,68 @@ def test_training_episodes_schema_exposes_replay_eval_args():
     assert "min_reward" in props
     assert "require_ready" in props
     assert "include_episodes" in props
+    assert "task_text" in props
     assert "replay_eval" in props["operation"]["enum"]
+    assert "behavioral_hints" in props["operation"]["enum"]
+
+
+def test_training_episodes_tool_behavioral_hints_redacts_private_payloads(tmp_path):
+    discover_builtin_tools()
+    db_path = tmp_path / "state.db"
+    private_result = "PRIVATE_TOOL_HINT_RESULT_MANGO"
+    private_stdout = "PRIVATE_TOOL_HINT_STDOUT_OTTER"
+    private_prompt = "PRIVATE_TOOL_HINT_PROMPT_VELVET"
+    db = SessionDB(db_path)
+    try:
+        recorder = TraceRecorder(session_id="sess", turn_id="turn", user_message_hash=hash_user_message("tool behavioral hint private fixture"))
+        with recorder.span("turn", "root"):
+            with recorder.span("model_call", "llm_api_call"):
+                pass
+            with recorder.span("tool_call", "terminal", {"result": private_result, "stdout": private_stdout, "nested": {"prompt": private_prompt}}):
+                pass
+            with recorder.span("final_answer", "turn.final_answer", {"completed": True}):
+                pass
+        recorder.finish("completed")
+        db.record_trace(recorder.to_trace_row(), recorder.to_span_rows())
+    finally:
+        db.close()
+
+    tool = registry.get_entry("training_episodes")
+    result = json.loads(tool.handler({
+        "operation": "behavioral_hints",
+        "db_path": str(db_path),
+        "task_text": f"dirty git pytest privacy task {private_prompt}",
+        "limit": 10,
+        "min_reward": 1.0,
+    }))
+    blob = json.dumps(result, sort_keys=True)
+
+    assert result["success"] is True
+    data = result["data"]
+    assert data["schema_version"] == "behavioral_hints.v1"
+    assert data["matches_count"] == 1
+    assert data["hints"]
+    assert data["privacy"]["raw_content_exported"] is False
+    assert data["privacy"]["includes_raw_episode_payloads"] is False
+    assert private_result not in blob
+    assert private_stdout not in blob
+    assert private_prompt not in blob
+    assert "steps" not in blob
+    assert "metadata" not in blob
+
+
+def test_training_episodes_tool_behavioral_hints_handles_empty_db(tmp_path):
+    discover_builtin_tools()
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path)
+    db.close()
+
+    tool = registry.get_entry("training_episodes")
+    result = json.loads(tool.handler({"operation": "behavioral_hints", "db_path": str(db_path), "task_text": "pytest git", "limit": 5}))
+
+    assert result["success"] is True
+    assert result["data"]["matches_count"] == 0
+    assert result["data"]["hints"] == []
 
 
 def test_semantic_code_tool_references_default_omits_context(tmp_path):

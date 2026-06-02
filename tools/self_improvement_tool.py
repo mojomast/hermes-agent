@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
+from agent.episode_retrieval import behavioral_hints_for_task
 from agent.semantic_code_index import semantic_lookup
 from agent.training_episodes import default_episode_export_path, episode_summary, export_episodes_jsonl, iter_episodes, replay_eval_episodes
 from hermes_state import DEFAULT_DB_PATH
@@ -21,9 +22,10 @@ TRAINING_EPISODES_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "operation": {"type": "string", "enum": ["summary", "export", "preview", "replay_eval"], "description": "Operation to run."},
+            "operation": {"type": "string", "enum": ["summary", "export", "preview", "replay_eval", "behavioral_hints"], "description": "Operation to run."},
             "db_path": {"type": "string", "description": "Optional Hermes state.db path. Defaults to active HERMES_HOME state.db."},
             "output_path": {"type": "string", "description": "JSONL export path. Defaults to ~/.hermes/exports/training_episodes.jsonl."},
+            "task_text": {"type": "string", "description": "Current task text used only for deterministic structural categories; raw text is never returned."},
             "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 5000},
             "ready_only": {"type": "boolean", "default": False},
             "min_reward": {"type": "number", "default": 1.0, "description": "Minimum acceptable reward for replay_eval."},
@@ -35,7 +37,7 @@ TRAINING_EPISODES_SCHEMA = {
 }
 
 
-def training_episodes(operation: str, db_path: str = "", output_path: str = "", limit: int = 100, ready_only: bool = False, min_reward: float = 1.0, require_ready: bool = True, include_episodes: bool = False) -> str:
+def training_episodes(operation: str, db_path: str = "", output_path: str = "", task_text: str = "", limit: int = 100, ready_only: bool = False, min_reward: float = 1.0, require_ready: bool = True, include_episodes: bool = False) -> str:
     try:
         db = Path(db_path).expanduser() if db_path else DEFAULT_DB_PATH
         if operation == "summary":
@@ -56,6 +58,16 @@ def training_episodes(operation: str, db_path: str = "", output_path: str = "", 
                     min_reward=min_reward,
                     require_ready=require_ready,
                     include_episodes=include_episodes,
+                ),
+            })
+        if operation == "behavioral_hints":
+            return _json({
+                "success": True,
+                "data": behavioral_hints_for_task(
+                    db_path=db,
+                    task_text=task_text,
+                    limit=limit,
+                    min_reward=min_reward,
                 ),
             })
         return tool_error(f"unsupported operation: {operation}")
@@ -98,6 +110,7 @@ registry.register(
         operation=args.get("operation", "summary"),
         db_path=args.get("db_path", ""),
         output_path=args.get("output_path", ""),
+        task_text=args.get("task_text", ""),
         limit=int(args.get("limit") or 100),
         ready_only=bool(args.get("ready_only") or False),
         min_reward=float(args.get("min_reward") if args.get("min_reward") is not None else 1.0),
