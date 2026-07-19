@@ -117,6 +117,7 @@ from agent.trajectory import (
     save_trajectory as _save_trajectory_to_file,
 )
 from agent.prompt_budget import build_prompt_budget_record, emit_prompt_budget_warnings
+from agent.tracing import TraceRecorder, active_tracer, hash_user_message
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 
 
@@ -3317,6 +3318,23 @@ class AIAgent:
         self._session_messages = messages
         self._save_session_log(messages)
         self._flush_messages_to_session_db(messages, conversation_history)
+        self._persist_turn_trace()
+
+    def _persist_turn_trace(self, status: str = "completed", error_class: str = None) -> None:
+        """Persist the active structural trace without affecting the user turn."""
+        tracer = active_tracer(self)
+        if not tracer or not self._session_db or getattr(tracer, "_persisted", False):
+            return
+        try:
+            root_cm = getattr(self, "_turn_root_span_cm", None)
+            if root_cm is not None:
+                root_cm.__exit__(None, None, None)
+                self._turn_root_span_cm = None
+            tracer.finish(status=status, error_class=error_class)
+            self._session_db.record_trace(tracer.to_trace_row(), tracer.to_span_rows())
+            tracer.mark_persisted()
+        except Exception as exc:
+            logger.debug("Session DB record_trace failed: %s", exc)
 
     def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Persist any un-flushed messages to the SQLite session store.
@@ -8647,6 +8665,17 @@ class AIAgent:
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
+            _tracer = active_tracer(self)
+            if _tracer:
+                _span_type = "subagent" if function_name == "delegate_task" else "tool_call"
+                with _tracer.span(
+                    _span_type, function_name,
+                    {"arg_count": len(function_args), "concurrent": True,
+                     "duration_ms": int(duration * 1000)},
+                ) as _tool_span:
+                    if is_error:
+                        _tool_span.status = "error"
+                        _tool_span.error_class = "ToolResultError"
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
@@ -9117,6 +9146,17 @@ class AIAgent:
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
             _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+            _tracer = active_tracer(self)
+            if _tracer:
+                _span_type = "subagent" if function_name == "delegate_task" else "tool_call"
+                with _tracer.span(
+                    _span_type, function_name,
+                    {"arg_count": len(function_args), "concurrent": False,
+                     "duration_ms": int(tool_duration * 1000)},
+                ) as _tool_span:
+                    if _is_error_result:
+                        _tool_span.status = "error"
+                        _tool_span.error_class = "ToolResultError"
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
             else:
@@ -9436,6 +9476,13 @@ class AIAgent:
         self._persist_user_message_override = persist_user_message
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
         effective_task_id = task_id or str(uuid.uuid4())
+        self._turn_tracer = TraceRecorder(
+            session_id=self.session_id or "",
+            turn_id=effective_task_id,
+            user_message_hash=hash_user_message(user_message),
+        )
+        self._turn_root_span_cm = self._turn_tracer.span("turn", "root")
+        self._turn_root_span_cm.__enter__()
         # Expose the active task_id so tools running mid-turn (e.g. delegate_task
         # in delegate_tool.py) can identify this agent for the cross-agent file
         # state registry.  Set BEFORE any tool dispatch so snapshots taken at
@@ -10185,12 +10232,42 @@ class AIAgent:
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
 
-                    if _use_streaming:
-                        response = self._interruptible_streaming_api_call(
-                            api_kwargs, on_first_delta=_stop_spinner
+                    _model_span_cm = None
+                    _tracer = active_tracer(self)
+                    if _tracer:
+                        _model_span_cm = _tracer.span(
+                            "model_call", "llm_api_call",
+                            {
+                                "api_call_index": api_call_count,
+                                "retry_count": retry_count,
+                                "provider": self.provider or self.api_mode,
+                                "model": self.model,
+                                "api_mode": self.api_mode,
+                                "streaming": _use_streaming,
+                                "message_count": len(api_messages),
+                                "tool_count": len(self.tools or []),
+                                "approx_input_tokens": approx_tokens,
+                            },
                         )
-                    else:
-                        response = self._interruptible_api_call(api_kwargs)
+                        _model_span_cm.__enter__()
+                    try:
+                        if _use_streaming:
+                            response = self._interruptible_streaming_api_call(
+                                api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        else:
+                            response = self._interruptible_api_call(api_kwargs)
+                    except Exception as _model_exc:
+                        if _model_span_cm:
+                            _model_span_cm.__exit__(
+                                _model_exc.__class__, _model_exc,
+                                getattr(_model_exc, "__traceback__", None),
+                            )
+                            _model_span_cm = None
+                        raise
+                    finally:
+                        if _model_span_cm:
+                            _model_span_cm.__exit__(None, None, None)
                     
                     api_duration = time.time() - api_start_time
                     
@@ -12665,6 +12742,18 @@ class AIAgent:
                 )
             except Exception as exc:
                 logger.warning("post_llm_call hook failed: %s", exc)
+
+        _tracer = active_tracer(self)
+        if _tracer:
+            with _tracer.span(
+                "final_answer", "turn.final_answer",
+                {
+                    "response_len": len(final_response) if final_response else 0,
+                    "message_count": len(messages), "api_calls": api_call_count,
+                    "completed": completed, "interrupted": interrupted,
+                },
+            ):
+                pass
 
         # Extract reasoning from the last assistant message (if any)
         last_reasoning = None

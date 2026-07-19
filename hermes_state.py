@@ -57,6 +57,38 @@ CREATE INDEX IF NOT EXISTS idx_prompt_budgets_session_time ON prompt_budgets(ses
 CREATE INDEX IF NOT EXISTS idx_prompt_budgets_trace ON prompt_budgets(trace_id);
 """
 
+TRACE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS traces (
+    trace_id TEXT PRIMARY KEY,
+    session_id TEXT,
+    turn_id TEXT,
+    user_message_hash TEXT,
+    start_time REAL NOT NULL,
+    end_time REAL,
+    status TEXT,
+    total_wall_ms INTEGER,
+    total_model_calls INTEGER DEFAULT 0,
+    total_tool_calls INTEGER DEFAULT 0,
+    total_subagents INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS spans (
+    span_id TEXT PRIMARY KEY,
+    trace_id TEXT NOT NULL REFERENCES traces(trace_id) ON DELETE CASCADE,
+    parent_span_id TEXT,
+    span_type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    start_time REAL NOT NULL,
+    end_time REAL,
+    status TEXT,
+    error_class TEXT,
+    metadata_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_traces_session_turn ON traces(session_id, turn_id);
+CREATE INDEX IF NOT EXISTS idx_traces_start_time ON traces(start_time DESC);
+CREATE INDEX IF NOT EXISTS idx_spans_trace_start ON spans(trace_id, start_time);
+CREATE INDEX IF NOT EXISTS idx_spans_type ON spans(span_type);
+"""
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
@@ -288,6 +320,8 @@ class SessionDB:
         # Forward-only prompt budget telemetry. Additive, idempotent DDL;
         # records token counts only (no prompts, tool args/results, or secrets).
         cursor.executescript(PROMPT_BUDGETS_SQL)
+        # Additive structural telemetry consumed by TrainingEpisode readers.
+        cursor.executescript(TRACE_SCHEMA_SQL)
 
         # Check schema version and run migrations
         cursor.execute("SELECT version FROM schema_version LIMIT 1")
@@ -594,6 +628,52 @@ class SessionDB:
         )
         def _do(conn):
             conn.execute(sql, params)
+        self._execute_write(_do)
+
+    def record_trace(self, trace_row: Dict[str, Any], span_rows: List[Dict[str, Any]]) -> None:
+        """Atomically persist one completed structural turn trace and its spans."""
+        if not trace_row or not trace_row.get("trace_id"):
+            return
+
+        trace_id = trace_row["trace_id"]
+
+        def _do(conn):
+            conn.execute(
+                """INSERT OR REPLACE INTO traces (
+                       trace_id, session_id, turn_id, user_message_hash,
+                       start_time, end_time, status, total_wall_ms,
+                       total_model_calls, total_tool_calls, total_subagents
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    trace_id, trace_row.get("session_id"), trace_row.get("turn_id"),
+                    trace_row.get("user_message_hash"), trace_row.get("start_time"),
+                    trace_row.get("end_time"), trace_row.get("status"),
+                    trace_row.get("total_wall_ms"),
+                    int(trace_row.get("total_model_calls") or 0),
+                    int(trace_row.get("total_tool_calls") or 0),
+                    int(trace_row.get("total_subagents") or 0),
+                ),
+            )
+            # A retry is a replacement of the complete span set, not a merge
+            # with a potentially partial prior write.
+            conn.execute("DELETE FROM spans WHERE trace_id = ?", (trace_id,))
+            for span in span_rows or []:
+                if not span.get("span_id"):
+                    continue
+                conn.execute(
+                    """INSERT INTO spans (
+                           span_id, trace_id, parent_span_id, span_type, name,
+                           start_time, end_time, status, error_class, metadata_json
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        span.get("span_id"), span.get("trace_id") or trace_id,
+                        span.get("parent_span_id"), span.get("span_type"),
+                        span.get("name"), span.get("start_time"),
+                        span.get("end_time"), span.get("status"),
+                        span.get("error_class"), span.get("metadata_json") or "{}",
+                    ),
+                )
+
         self._execute_write(_do)
 
     def record_prompt_budget(self, budget_row: Dict[str, Any]) -> str:
