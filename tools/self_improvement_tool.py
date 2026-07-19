@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import json
+import math
+from numbers import Real
 from pathlib import Path
 from typing import Any, Dict
 
 from agent.episode_retrieval import behavioral_hints_for_task
+from agent.contrastive_episode_retrieval import contrastive_replay_eval, retrieve_contrastive_episodes
+from agent.outcome_events import outcome_summary
 from agent.semantic_code_index import semantic_lookup
 from agent.training_episodes import default_episode_export_path, episode_summary, export_episodes_jsonl, iter_episodes, replay_eval_episodes
 from hermes_state import DEFAULT_DB_PATH
@@ -22,13 +26,14 @@ TRAINING_EPISODES_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "operation": {"type": "string", "enum": ["summary", "export", "preview", "replay_eval", "behavioral_hints"], "description": "Operation to run."},
+            "operation": {"type": "string", "enum": ["summary", "export", "preview", "replay_eval", "behavioral_hints", "outcome_summary", "contrastive_hints", "contrastive_replay_eval"], "description": "Operation to run."},
             "db_path": {"type": "string", "description": "Optional Hermes state.db path. Defaults to active HERMES_HOME state.db."},
             "output_path": {"type": "string", "description": "JSONL export path. Defaults to ~/.hermes/exports/training_episodes.jsonl."},
-            "task_text": {"type": "string", "description": "Current task text used only for deterministic structural categories; raw text is never returned."},
+            "task_text": {"type": "string", "description": "Operator-supplied task text for shadow inspection categories; raw text is never returned and hints are not automatically applied."},
             "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 5000},
             "ready_only": {"type": "boolean", "default": False},
             "min_reward": {"type": "number", "default": 1.0, "description": "Minimum acceptable reward for replay_eval."},
+            "max_negative_reward": {"type": "number", "default": 0.0, "description": "Maximum reward classified as negative by contrastive shadow operations."},
             "require_ready": {"type": "boolean", "default": True, "description": "Fail replay_eval rows that are not ready_for_training."},
             "include_episodes": {"type": "boolean", "default": False, "description": "Include compact per-episode replay/eval rows."},
         },
@@ -37,9 +42,15 @@ TRAINING_EPISODES_SCHEMA = {
 }
 
 
-def training_episodes(operation: str, db_path: str = "", output_path: str = "", task_text: str = "", limit: int = 100, ready_only: bool = False, min_reward: float = 1.0, require_ready: bool = True, include_episodes: bool = False) -> str:
+def training_episodes(operation: str, db_path: str = "", output_path: str = "", task_text: str = "", limit: int = 100, ready_only: bool = False, min_reward: float = 1.0, max_negative_reward: float = 0.0, require_ready: bool = True, include_episodes: bool = False) -> str:
     try:
         db = Path(db_path).expanduser() if db_path else DEFAULT_DB_PATH
+        if operation in {"contrastive_hints", "contrastive_replay_eval"}:
+            for name, value in (("min_reward", min_reward), ("max_negative_reward", max_negative_reward)):
+                if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
+                    raise ValueError(f"{name} must be a finite numeric non-bool value")
+            if max_negative_reward >= min_reward:
+                raise ValueError("max_negative_reward must be less than min_reward")
         if operation == "summary":
             return _json({"success": True, "data": episode_summary(db_path=db, limit=limit)})
         if operation == "export":
@@ -68,6 +79,34 @@ def training_episodes(operation: str, db_path: str = "", output_path: str = "", 
                     task_text=task_text,
                     limit=limit,
                     min_reward=min_reward,
+                ),
+            })
+        if operation == "outcome_summary":
+            return _json({"success": True, "data": outcome_summary(db)})
+        if operation == "contrastive_hints":
+            return _json({
+                "success": True,
+                "data": retrieve_contrastive_episodes(
+                    db_path=db,
+                    task_text=task_text,
+                    positive_limit=min(limit, 200),
+                    negative_limit=min(limit, 200),
+                    corrected_limit=min(limit, 200),
+                    min_positive_reward=min_reward,
+                    max_negative_reward=max_negative_reward,
+                ),
+            })
+        if operation == "contrastive_replay_eval":
+            return _json({
+                "success": True,
+                "data": contrastive_replay_eval(
+                    db_path=db,
+                    task_text=task_text,
+                    positive_limit=min(limit, 200),
+                    negative_limit=min(limit, 200),
+                    corrected_limit=min(limit, 200),
+                    min_positive_reward=min_reward,
+                    max_negative_reward=max_negative_reward,
                 ),
             })
         return tool_error(f"unsupported operation: {operation}")
@@ -113,11 +152,12 @@ registry.register(
         task_text=args.get("task_text", ""),
         limit=int(args.get("limit") or 100),
         ready_only=bool(args.get("ready_only") or False),
-        min_reward=float(args.get("min_reward") if args.get("min_reward") is not None else 1.0),
+        min_reward=args.get("min_reward") if args.get("min_reward") is not None else 1.0,
+        max_negative_reward=args.get("max_negative_reward") if args.get("max_negative_reward") is not None else 0.0,
         require_ready=bool(args.get("require_ready") if args.get("require_ready") is not None else True),
         include_episodes=bool(args.get("include_episodes") or False),
     ),
-    description="Trace-to-RL TrainingEpisode projection/export tool",
+    description="Trace-to-RL projection/export plus operator-invoked shadow inspection; contrastive hints are not automatically applied",
 )
 
 registry.register(

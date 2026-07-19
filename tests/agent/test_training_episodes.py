@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 from agent.tracing import TraceRecorder, hash_user_message
 from agent.training_episodes import (
@@ -311,3 +312,35 @@ def test_export_jsonl_privacy_regression_redacts_raw_payloads(tmp_path):
     assert row["privacy"]["raw_content_exported"] is False
     for private_value in [private_result, private_stdout, private_response, private_prompt, "private export prompt", "sk-test-private"]:
         assert private_value not in text
+
+
+def test_iter_episodes_batches_outcomes_and_orders_trace_and_span_ties(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path)
+    db.close()
+    with sqlite3.connect(db_path) as con:
+        for index in range(201):
+            trace_id = f"trace-{index:03}"
+            con.execute("INSERT INTO traces VALUES (?,?,?,?,?,?,?,?,?,?,?)", (trace_id, "s", "t", "hash", 1, 2, "completed", 100, 1, 0, 0))
+        con.execute(
+            "INSERT INTO spans (span_id, trace_id, parent_span_id, span_type, name, start_time, end_time, status, error_class, metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("span-z", "trace-200", None, "tool_call", "z", 1, 2, "completed", None, "{}"),
+        )
+        con.execute(
+            "INSERT INTO spans (span_id, trace_id, parent_span_id, span_type, name, start_time, end_time, status, error_class, metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("span-a", "trace-200", None, "tool_call", "a", 1, 2, "completed", None, "{}"),
+        )
+
+    import agent.training_episodes as module
+    calls = []
+    real = module.outcome_summaries
+
+    def tracked(path, trace_ids):
+        calls.append(list(trace_ids))
+        return real(path, trace_ids)
+
+    monkeypatch.setattr(module, "outcome_summaries", tracked)
+    episodes = list(iter_episodes(db_path, limit=201))
+    assert [episode.trace_id for episode in episodes[:2]] == ["trace-200", "trace-199"]
+    assert [step.name for step in episodes[0].steps] == ["a", "z"]
+    assert [len(call) for call in calls] == [200, 1]

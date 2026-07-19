@@ -21,6 +21,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_state import DEFAULT_DB_PATH
+from agent.outcome_events import outcome_summaries
 
 SCHEMA_VERSION = "training_episode.v1"
 REPLAY_EVAL_SCHEMA_VERSION = "training_episode_replay_eval.v1"
@@ -107,6 +108,9 @@ class TrainingEpisode:
     reward: float
     ready_for_training: bool
     privacy: Dict[str, Any]
+    outcome_event_count: int = 0
+    outcome_event_type_counts: Dict[str, int] = field(default_factory=dict)
+    outcome_taxonomy_counts: Dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -235,7 +239,12 @@ def reward_from_signals(signals: Iterable[OutcomeSignal]) -> float:
     return round(score, 4)
 
 
-def trace_to_episode(trace: sqlite3.Row | Dict[str, Any], spans: Iterable[sqlite3.Row | Dict[str, Any]]) -> TrainingEpisode:
+def trace_to_episode(
+    trace: sqlite3.Row | Dict[str, Any],
+    spans: Iterable[sqlite3.Row | Dict[str, Any]],
+    *,
+    event_summary: Optional[Dict[str, Any]] = None,
+) -> TrainingEpisode:
     # sqlite rows and dicts both support [] lookup; normalize missing via helper.
     trace_d = dict(trace)
     span_ds = [dict(s) for s in spans]
@@ -254,6 +263,7 @@ def trace_to_episode(trace: sqlite3.Row | Dict[str, Any], spans: Iterable[sqlite
     signals = outcome_signals_for(trace_d, span_ds)
     reward = reward_from_signals(signals)
     ready = bool(trace_d.get("status") == "completed" and any(s.name == "trace_completed" and bool(s.value) for s in signals))
+    compact_events = event_summary or {}
     return TrainingEpisode(
         schema_version=SCHEMA_VERSION,
         episode_id=f"episode:{trace_d.get('trace_id')}",
@@ -276,20 +286,26 @@ def trace_to_episode(trace: sqlite3.Row | Dict[str, Any], spans: Iterable[sqlite
             "raw_content_keys": sorted(RAW_CONTENT_KEYS),
             "generated_artifact_patterns": list(GENERATED_ARTIFACT_PATTERNS),
         },
+        outcome_event_count=int(compact_events.get("event_count", 0)),
+        outcome_event_type_counts=dict(compact_events.get("event_type_counts", {})),
+        outcome_taxonomy_counts=dict(compact_events.get("taxonomy_counts", {})),
     )
 
 
 def iter_episodes(db_path: Path = DEFAULT_DB_PATH, limit: int = 100, min_reward: float | None = None, ready_only: bool = False) -> Iterable[TrainingEpisode]:
     with _connect_readonly(Path(db_path)) as con:
-        traces = con.execute("SELECT * FROM traces ORDER BY start_time DESC LIMIT ?", (int(limit),)).fetchall()
-        for trace in traces:
-            spans = con.execute("SELECT * FROM spans WHERE trace_id = ? ORDER BY start_time ASC", (trace["trace_id"],)).fetchall()
-            episode = trace_to_episode(trace, spans)
-            if min_reward is not None and episode.reward < min_reward:
-                continue
-            if ready_only and not episode.ready_for_training:
-                continue
-            yield episode
+        traces = con.execute("SELECT * FROM traces ORDER BY start_time DESC, trace_id DESC LIMIT ?", (int(limit),)).fetchall()
+        for offset in range(0, len(traces), 200):
+            chunk = traces[offset:offset + 200]
+            summaries = outcome_summaries(db_path, [trace["trace_id"] for trace in chunk])
+            for trace in chunk:
+                spans = con.execute("SELECT * FROM spans WHERE trace_id = ? ORDER BY start_time ASC, span_id ASC", (trace["trace_id"],)).fetchall()
+                episode = trace_to_episode(trace, spans, event_summary=summaries[trace["trace_id"]])
+                if min_reward is not None and episode.reward < min_reward:
+                    continue
+                if ready_only and not episode.ready_for_training:
+                    continue
+                yield episode
 
 
 def _is_raw_payload_descriptor(value: Any) -> bool:

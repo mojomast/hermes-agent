@@ -1,5 +1,8 @@
 import json
 
+import pytest
+
+import tools.self_improvement_tool as self_improvement_tool
 from agent.tracing import TraceRecorder, hash_user_message
 from hermes_state import SessionDB
 from model_tools import discover_builtin_tools
@@ -69,6 +72,109 @@ def test_training_episodes_schema_exposes_replay_eval_args():
     assert "task_text" in props
     assert "replay_eval" in props["operation"]["enum"]
     assert "behavioral_hints" in props["operation"]["enum"]
+    assert "outcome_summary" in props["operation"]["enum"]
+    assert "contrastive_hints" in props["operation"]["enum"]
+    assert "contrastive_replay_eval" in props["operation"]["enum"]
+    assert "max_negative_reward" in props
+
+
+def test_training_episodes_contrastive_operations_are_shadow_only(tmp_path):
+    discover_builtin_tools()
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path)
+    db.close()
+    tool = registry.get_entry("training_episodes")
+
+    summary = json.loads(tool.handler({"operation": "outcome_summary", "db_path": str(db_path)}))
+    hints = json.loads(tool.handler({"operation": "contrastive_hints", "db_path": str(db_path), "task_text": "new capability subsystem"}))
+    replay = json.loads(tool.handler({"operation": "contrastive_replay_eval", "db_path": str(db_path), "task_text": "new capability subsystem"}))
+
+    assert summary["success"] is True and summary["data"]["event_count"] == 0
+    assert hints["data"]["schema_version"] == "contrastive_episode_retrieval.v1"
+    assert replay["data"]["schema_version"] == "contrastive_replay_eval.v1"
+    assert replay["data"]["shadow_only"] is True
+    assert replay["data"]["prompt_modified"] is False
+    assert replay["data"]["privacy_eval_valid"] is False
+    assert replay["data"]["ok"] is False
+
+
+def test_training_episodes_tool_forwards_max_negative_reward(tmp_path):
+    discover_builtin_tools()
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path)
+    recorder = TraceRecorder(session_id="s", turn_id="t", user_message_hash="h", trace_id="threshold")
+    with recorder.span("turn", "root"):
+        with recorder.span("tool_call", "terminal"):
+            pass
+        with recorder.span("final_answer", "turn.final_answer", {"completed": True}):
+            pass
+    recorder.finish("completed")
+    db.record_trace(recorder.to_trace_row(), recorder.to_span_rows())
+    db.close()
+    tool = registry.get_entry("training_episodes")
+    result = json.loads(tool.handler({
+        "operation": "contrastive_hints", "db_path": str(db_path),
+        "task_text": "debug failure", "max_negative_reward": -100,
+    }))
+    assert result["data"]["negative_matches"] == []
+
+
+@pytest.mark.parametrize("operation,target_name", [
+    ("contrastive_hints", "retrieve_contrastive_episodes"),
+    ("contrastive_replay_eval", "contrastive_replay_eval"),
+])
+def test_registered_contrastive_handlers_forward_all_arguments(monkeypatch, operation, target_name):
+    discover_builtin_tools()
+    captured = {}
+    monkeypatch.setattr(self_improvement_tool, target_name, lambda **kwargs: captured.update(kwargs) or {})
+
+    result = json.loads(registry.get_entry("training_episodes").handler({
+        "operation": operation,
+        "db_path": "/tmp/shadow-state.db",
+        "task_text": "operator shadow task",
+        "limit": 17,
+        "min_reward": 2.5,
+        "max_negative_reward": -3.5,
+    }))
+
+    assert result["success"] is True
+    assert str(captured.pop("db_path")) == "/tmp/shadow-state.db"
+    assert captured == {
+        "task_text": "operator shadow task",
+        "positive_limit": 17,
+        "negative_limit": 17,
+        "corrected_limit": 17,
+        "min_positive_reward": 2.5,
+        "max_negative_reward": -3.5,
+    }
+
+
+@pytest.mark.parametrize("field,value", [("min_reward", "nan"), ("max_negative_reward", "inf")])
+def test_registered_tool_surfaces_non_finite_threshold_errors(field, value):
+    discover_builtin_tools()
+    result = json.loads(registry.get_entry("training_episodes").handler({
+        "operation": "contrastive_hints", "db_path": "/tmp/unused.db",
+        "task_text": "debug", field: value,
+    }))
+    assert field in result["error"]
+
+
+@pytest.mark.parametrize("minimum,maximum", [(1.0, 1.0), (1.0, 2.0)])
+def test_registered_contrastive_tool_rejects_overlapping_thresholds(minimum, maximum):
+    discover_builtin_tools()
+    result = json.loads(registry.get_entry("training_episodes").handler({
+        "operation": "contrastive_replay_eval", "db_path": "/tmp/unused.db",
+        "task_text": "debug", "min_reward": minimum,
+        "max_negative_reward": maximum,
+    }))
+    assert "max_negative_reward" in result["error"]
+
+
+def test_contrastive_tool_description_is_operator_shadow_inspection():
+    discover_builtin_tools()
+    entry = registry.get_entry("training_episodes")
+    assert "operator-invoked shadow inspection" in entry.description
+    assert "not automatically applied" in entry.description
 
 
 def test_training_episodes_tool_behavioral_hints_redacts_private_payloads(tmp_path):
