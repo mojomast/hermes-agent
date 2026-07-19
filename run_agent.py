@@ -118,7 +118,15 @@ from agent.trajectory import (
 )
 from agent.prompt_budget import build_prompt_budget_record, emit_prompt_budget_warnings
 from agent.tracing import TraceRecorder, active_tracer, hash_user_message
+from agent.shadow_outcome_capture import classify_foreground_pytest
+from agent.outcome_events import append_producer_outcome_event
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
+
+_MAX_PENDING_SHADOW_OUTCOMES = 256
+
+
+class ShadowOutcomeConflict(RuntimeError):
+    """A deterministic shadow event ID was observed with conflicting facts."""
 
 
 
@@ -1108,6 +1116,11 @@ class AIAgent:
         # their tids explicitly.
         self._tool_worker_threads: set[int] = set()
         self._tool_worker_threads_lock = threading.Lock()
+        # Main-thread-only shadow evidence awaiting a successful append. Entries
+        # retain their own trace attribution across subsequent turns.
+        self._shadow_outcome_candidates: Dict[str, Any] = {}
+        self._shadow_outcome_quarantined: set[str] = set()
+        self._shadow_outcome_capture_disabled = False
         
         # Subagent delegation state
         self._delegate_depth = 0        # 0 = top-level agent, incremented for children
@@ -3321,7 +3334,7 @@ class AIAgent:
         self._persist_turn_trace()
 
     def _persist_turn_trace(self, status: str = "completed", error_class: str = None) -> None:
-        """Persist the active structural trace without affecting the user turn."""
+        """Persist trace first, then retry queued shadow outcomes without failing the turn."""
         tracer = active_tracer(self)
         if not tracer or not self._session_db or getattr(tracer, "_persisted", False):
             return
@@ -3332,9 +3345,117 @@ class AIAgent:
                 self._turn_root_span_cm = None
             tracer.finish(status=status, error_class=error_class)
             self._session_db.record_trace(tracer.to_trace_row(), tracer.to_span_rows())
+            pending = getattr(self, "_shadow_outcome_candidates", {})
+            attempted = 0
+            for event_id, candidate in tuple(pending.items()):
+                attempted += 1
+                try:
+                    append_producer_outcome_event(self._session_db.db_path, candidate)
+                    if pending.get(event_id) == candidate:
+                        pending.pop(event_id, None)
+                except Exception as capture_error:
+                    self._log_shadow_outcome_failure(
+                        stage="append", error=capture_error,
+                        pending_count=len(pending), attempt_count=attempted,
+                    )
             tracer.mark_persisted()
         except Exception as exc:
-            logger.debug("Session DB record_trace failed: %s", exc)
+            if getattr(self, "_shadow_outcome_candidates", {}):
+                self._log_shadow_outcome_failure(
+                    stage="record_trace", error=exc,
+                    pending_count=len(self._shadow_outcome_candidates), attempt_count=0,
+                )
+            else:
+                logger.debug("Session DB record_trace failed: %s", exc)
+
+    def _log_shadow_outcome_failure(
+        self, *, stage: str, error: Exception, pending_count: int, attempt_count: int,
+    ) -> None:
+        """Emit count-only diagnostics without identifiers or raw evidence."""
+        try:
+            logger.warning(
+                "shadow_outcome_capture %s failed", stage,
+                extra={
+                    "stage": stage,
+                    "error_class": type(error).__name__,
+                    "pending_count": pending_count,
+                    "attempt_count": attempt_count,
+                },
+            )
+        except Exception:
+            pass
+
+    def _start_shadow_outcome_turn(self, tracer: TraceRecorder) -> None:
+        """Install a new turn tracer while retaining retryable prior evidence."""
+        self._turn_tracer = tracer
+
+    def _queue_shadow_outcome(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        tool_arguments: Dict[str, Any],
+        tool_result: Any,
+    ) -> None:
+        """Classify transient foreground pytest output without changing the result."""
+        try:
+            if getattr(self, "_shadow_outcome_capture_disabled", False) or self._interrupt_requested or any(
+                getattr(self, attribute, None) == "background_review"
+                for attribute in (
+                    "platform", "agent_id", "_agent_id",
+                    "_memory_write_origin", "_memory_write_context",
+                )
+            ):
+                return
+            tracer = active_tracer(self)
+            if tracer is None:
+                return
+            structured_result = tool_result
+            if isinstance(structured_result, str):
+                try:
+                    structured_result = json.loads(structured_result)
+                except (TypeError, ValueError):
+                    return
+            candidate = classify_foreground_pytest(
+                trace_id=tracer.trace_id,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                tool_arguments=tool_arguments,
+                tool_result=structured_result,
+            )
+            if candidate is None:
+                return
+            pending = self._shadow_outcome_candidates
+            quarantined = self._shadow_outcome_quarantined
+            if candidate.event_id in quarantined:
+                return
+            existing = pending.get(candidate.event_id)
+            if existing is not None and existing != candidate:
+                pending.pop(candidate.event_id, None)
+                if len(quarantined) >= _MAX_PENDING_SHADOW_OUTCOMES:
+                    self._shadow_outcome_capture_disabled = True
+                    pending.clear()
+                else:
+                    quarantined.add(candidate.event_id)
+                self._log_shadow_outcome_failure(
+                    stage="queue_conflict", error=ShadowOutcomeConflict(),
+                    pending_count=len(pending), attempt_count=2,
+                )
+                return
+            if existing is not None:
+                return
+            if len(pending) >= _MAX_PENDING_SHADOW_OUTCOMES:
+                pending.pop(next(iter(pending)))
+                self._log_shadow_outcome_failure(
+                    stage="queue_capacity", error=OverflowError(),
+                    pending_count=len(pending), attempt_count=1,
+                )
+            pending[candidate.event_id] = candidate
+        except Exception as capture_error:
+            self._log_shadow_outcome_failure(
+                stage="classify", error=capture_error,
+                pending_count=len(getattr(self, "_shadow_outcome_candidates", {})),
+                attempt_count=1,
+            )
 
     def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Persist any un-flushed messages to the SQLite session store.
@@ -8772,6 +8893,12 @@ class AIAgent:
             else:
                 function_name, function_args, function_result, tool_duration, is_error = r
 
+                queue_shadow_outcome = getattr(self, "_queue_shadow_outcome", None)
+                if queue_shadow_outcome is not None:
+                    queue_shadow_outcome(
+                        tc.id, function_name, function_args, function_result,
+                    )
+
                 if is_error:
                     result_preview = function_result[:200] if len(function_result) > 200 else function_result
                     logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
@@ -9139,6 +9266,10 @@ class AIAgent:
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 tool_duration = time.time() - tool_start_time
 
+            self._queue_shadow_outcome(
+                tool_call.id, function_name, function_args, function_result,
+            )
+
             result_preview = function_result if self.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )
@@ -9476,11 +9607,11 @@ class AIAgent:
         self._persist_user_message_override = persist_user_message
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
         effective_task_id = task_id or str(uuid.uuid4())
-        self._turn_tracer = TraceRecorder(
+        self._start_shadow_outcome_turn(TraceRecorder(
             session_id=self.session_id or "",
             turn_id=effective_task_id,
             user_message_hash=hash_user_message(user_message),
-        )
+        ))
         self._turn_root_span_cm = self._turn_tracer.span("turn", "root")
         self._turn_root_span_cm.__enter__()
         # Expose the active task_id so tools running mid-turn (e.g. delegate_task

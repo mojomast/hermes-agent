@@ -1,4 +1,5 @@
 import sqlite3
+from dataclasses import replace
 
 import pytest
 
@@ -6,6 +7,7 @@ from agent.outcome_events import (
     OutcomeEvent,
     OutcomeEvidenceSummary,
     append_outcome_event,
+    append_producer_outcome_event,
     init_outcome_events,
     outcome_summary,
     outcome_summaries,
@@ -13,6 +15,7 @@ from agent.outcome_events import (
     query_outcome_correction_pairs,
     query_outcome_events,
 )
+from agent.shadow_outcome_capture import ShadowOutcomeCandidate, classify_foreground_pytest
 from hermes_state import SessionDB
 
 
@@ -231,3 +234,91 @@ def test_later_trusted_verifier_failure_invalidates_pair(tmp_path):
 def test_latest_trusted_pass_after_correction_authorizes_pair(tmp_path):
     pairs = _strict_pair_at_times(tmp_path / "state.db", [("failure", "verification_failed", 11), ("pass", "verification_passed", 12)])
     assert len(pairs) == 1
+
+
+def _producer_candidate(event_type="verification_passed", event_id=None):
+    candidate = classify_foreground_pytest(
+        trace_id="trace-1", tool_call_id="call-1", tool_name="terminal",
+        tool_arguments={"command": "pytest tests", "background": False},
+        tool_result={"exit_code": 0},
+    )
+    if event_type != candidate.event_type:
+        candidate = replace(candidate, event_type=event_type)
+    if event_id is not None:
+        candidate = replace(candidate, event_id=event_id)
+    return candidate
+
+
+def test_authorized_producer_append_fixes_event_fields(tmp_path):
+    path = tmp_path / "state.db"
+    _trace_db(path)
+    event = append_producer_outcome_event(path, _producer_candidate())
+    assert event.event_id.startswith("shadow:")
+    assert event.trace_id == "trace-1"
+    assert event.event_type == "verification_passed"
+    assert event.source == "verifier"
+    assert event.polarity == "positive"
+    assert event.confidence == 1.0
+    assert event.taxonomy_code is None
+    assert event.evidence_digest is None
+    assert event.supersedes_event_id is None
+
+
+def test_authorized_producer_exact_retry_is_idempotent(tmp_path):
+    path = tmp_path / "state.db"
+    _trace_db(path)
+    candidate = _producer_candidate()
+    first = append_producer_outcome_event(path, candidate)
+    second = append_producer_outcome_event(path, candidate)
+    assert second == first
+    assert query_outcome_events(path, trace_id="trace-1") == [first]
+
+
+def test_authorized_producer_conflicting_duplicate_fails_closed(tmp_path):
+    path = tmp_path / "state.db"
+    _trace_db(path)
+    append_producer_outcome_event(path, _producer_candidate("verification_passed"))
+    with pytest.raises(ValueError, match="conflicting duplicate"):
+        append_producer_outcome_event(path, _producer_candidate("verification_failed"))
+    assert query_outcome_events(path, trace_id="trace-1")[0].event_type == "verification_passed"
+
+
+@pytest.mark.parametrize("producer", ["", "foreground_pytest.v2", "user", "foreground_pytest.v1 "])
+def test_authorized_producer_rejects_unrecognized_authority(tmp_path, producer):
+    path = tmp_path / "state.db"
+    _trace_db(path)
+    candidate = ShadowOutcomeCandidate(
+        event_id="shadow:abc", trace_id="trace-1", tool_call_id="call-1",
+        producer=producer, event_type="verification_passed",
+    )
+    with pytest.raises(ValueError, match="unauthorized producer"):
+        append_producer_outcome_event(path, candidate)
+    assert query_outcome_events(path) == []
+
+
+def test_authorized_producer_permits_only_verification_pass_or_fail(tmp_path):
+    path = tmp_path / "state.db"
+    _trace_db(path)
+    with pytest.raises(ValueError, match="event type"):
+        append_producer_outcome_event(path, _producer_candidate("user_correction"))
+    assert query_outcome_events(path) == []
+
+
+def test_authorized_producer_rejects_forged_structural_id(tmp_path):
+    path = tmp_path / "state.db"
+    _trace_db(path)
+    with pytest.raises(ValueError, match="structural"):
+        append_producer_outcome_event(path, _producer_candidate(event_id="shadow:forged"))
+    assert query_outcome_events(path) == []
+
+
+def test_low_level_fixture_append_still_rejects_duplicate_ids(tmp_path):
+    path = tmp_path / "state.db"
+    _trace_db(path)
+    kwargs = dict(
+        trace_id="trace-1", event_type="verification_passed", source="verifier",
+        polarity="positive", confidence=1.0, event_id="fixture-event",
+    )
+    append_outcome_event(path, **kwargs)
+    with pytest.raises(sqlite3.IntegrityError):
+        append_outcome_event(path, **kwargs)
