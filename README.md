@@ -123,6 +123,10 @@ All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes
 | [CLI Reference](https://hermes-agent.nousresearch.com/docs/reference/cli-commands) | All commands and flags |
 | [Environment Variables](https://hermes-agent.nousresearch.com/docs/reference/environment-variables) | Complete env var reference |
 
+### Correction-aware shadow learning (release branch)
+
+This integrated Hermes branch can persist structural traces, capture narrowly authorized foreground-pytest outcomes, and report correction-aware contrastive and recurrence metrics. It remains evaluation-only: it does not train a standalone model, adapt weights, modify prompts, or activate lessons. See **[Correction-aware shadow learning](docs/CORRECTION_AWARE_LEARNING.md)** for the producer trust boundary, privacy contract, lifecycle policy, operator interface, current fixture metrics, limitations, and exact reproduction commands.
+
 ---
 
 ## Migrating from OpenClaw
