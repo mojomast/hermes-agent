@@ -10,6 +10,8 @@ Writes no generated artifacts unless --output-json is supplied.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import json
 import math
 import sys
@@ -24,7 +26,12 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from agent.semantic_code_index import get_diagnostics, go_to_definition, list_references, semantic_lookup
 from agent.contrastive_episode_retrieval import contrastive_replay_eval
-from agent.outcome_events import append_outcome_event
+from agent.outcome_events import (
+    OPERATOR_RELATION_PRODUCER, append_outcome_event, append_producer_outcome_event,
+    retract_outcome_event,
+)
+from agent.shadow_outcome_capture import classify_foreground_pytest
+from agent.shadow_recurrence import evaluate_shadow_recurrence
 from agent.tracing import TraceRecorder, hash_user_message
 from agent.training_episodes import export_episodes_jsonl, iter_episodes, replay_eval_episodes
 from hermes_state import SessionDB
@@ -80,10 +87,10 @@ def _fixture_raw_metadata() -> dict:
 
 def _record_fixture_trace(
     db: SessionDB, *, trace_id: str, successful: bool, tools: tuple[str, ...],
-    plant_canaries: bool = False,
+    plant_canaries: bool = False, session_id: str = "eval-session",
 ) -> None:
     recorder = TraceRecorder(
-        session_id="eval-session", turn_id=f"eval-{trace_id}",
+        session_id=session_id, turn_id=f"eval-{trace_id}",
         user_message_hash=hash_user_message("eval task"), trace_id=trace_id,
     )
     with recorder.span("turn", "root"):
@@ -163,6 +170,204 @@ def make_code_fixture(root: Path) -> None:
     (root / "index.ts").write_text("export function loadUser() { return { name: 'Ada' } }\n", encoding="utf-8")
 
 
+def _lesson_for(report: dict, taxonomy_code: str) -> dict:
+    return next(item for item in report["lessons"] if item["taxonomy_code"] == taxonomy_code)
+
+
+def _count_only_recurrence(report: dict) -> dict:
+    """Project the canonical report without lesson/store identifiers."""
+    if (
+        report.get("shadow_only") is not True
+        or report.get("activation_allowed") is not False
+        or report.get("prompt_modified") is not False
+    ):
+        raise RuntimeError("shadow recurrence safety declarations failed closed")
+    return {
+        "schema_version": "shadow_recurrence_eval.v1",
+        "policy_version": report.get("policy_version", ""),
+        "shadow_only": report.get("shadow_only") is True,
+        "activation_allowed": False,
+        "prompt_modified": False,
+        "historical_event_count": int(report.get("historical_event_count", 0)),
+        "effective_event_count": int(report.get("effective_event_count", 0)),
+        "candidate_lesson_count": int(report.get("candidate_lesson_count", 0)),
+        "activation_eligible_lesson_count": int(report.get("activation_eligible_lesson_count", 0)),
+        "active_lesson_count": int(report.get("active_lesson_count", 0)),
+    }
+
+
+def _validate_recurrence_privacy(report: dict, *, expected_canary_count: int, planted_canary_count: int) -> tuple[int, int]:
+    privacy = report.get("privacy")
+    false_keys = (
+        "raw_content_exported", "raw_user_text_read", "raw_prompt_read",
+        "raw_tool_payloads_read", "evidence_digests_exported", "store_identifiers_exported",
+    )
+    malformed = not isinstance(privacy, dict)
+    malformed = malformed or any(privacy.get(key) is not False for key in false_keys)
+    malformed = malformed or privacy.get("taxonomy_codes_allowlisted") is not True
+    if malformed:
+        raise RuntimeError("malformed shadow recurrence privacy declarations")
+    blob = json.dumps(report, sort_keys=True)
+    coverage = sum(canary not in blob for canary in set(FIXTURE_PRIVACY_CANARIES))
+    if expected_canary_count != planted_canary_count or coverage != expected_canary_count:
+        raise RuntimeError("shadow recurrence privacy canary coverage mismatch")
+    return coverage, sum(canary in blob for canary in set(FIXTURE_PRIVACY_CANARIES))
+
+
+_SYNTHETIC_MANUAL_USER_MISTAKE_ROOTS = (
+    ("recurrence-a", "recurrence-negative-a", "recurrence-session-1"),
+    ("recurrence-b", "recurrence-negative-b", "recurrence-session-2"),
+    ("recurrence-c", "recurrence-negative-c", "recurrence-session-3"),
+    ("recurrence-d", "recurrence-negative-d", "recurrence-session-4"),
+)
+
+
+def _append_synthetic_manual_user_mistake(
+    db_path: Path, *, trace_id: str, event_id: str, taxonomy_code: str, created_at: int,
+):
+    """Plant synthetic-only manual user evidence; never an active adaptation."""
+    return append_outcome_event(
+        db_path, trace_id=trace_id, event_id=event_id,
+        event_type="duplicate_proposal", source="user", polarity="negative",
+        confidence=.99, taxonomy_code=taxonomy_code, created_at=created_at,
+    )
+
+
+def evaluate_synthetic_shadow_recurrence(db_path: Path, *, limit: int, planted_canary_count: int) -> dict:
+    """Exercise capture, persistence, lifecycle, privacy, and parity end to end."""
+    db = SessionDB(db_path)
+    try:
+        for trace_id, session_id, canaries in (
+            *((trace_id, session_id, trace_id == "recurrence-a")
+              for trace_id, _event_id, session_id in _SYNTHETIC_MANUAL_USER_MISTAKE_ROOTS),
+            ("recurrence-replacement", "recurrence-replacement-session", False),
+            ("recurrence-operator", "recurrence-operator-session", False),
+        ):
+            _record_fixture_trace(
+                db, trace_id=trace_id, successful=True, tools=("terminal",),
+                plant_canaries=canaries, session_id=session_id,
+            )
+    finally:
+        db.close()
+
+    taxonomy = "duplicate_existing_capability"
+    first = _append_synthetic_manual_user_mistake(
+        db_path, trace_id="recurrence-a", event_id="recurrence-negative-a",
+        taxonomy_code=taxonomy, created_at=1,
+    )
+    observed = evaluate_shadow_recurrence(db_path, limit=limit)
+    _append_synthetic_manual_user_mistake(
+        db_path, trace_id="recurrence-b", event_id="recurrence-negative-b",
+        taxonomy_code=taxonomy, created_at=2,
+    )
+    candidate = evaluate_shadow_recurrence(db_path, limit=limit)
+    for created_at, (trace_id, event_id, _session_id) in enumerate(
+        _SYNTHETIC_MANUAL_USER_MISTAKE_ROOTS[2:], start=3,
+    ):
+        _append_synthetic_manual_user_mistake(
+            db_path, trace_id=trace_id, event_id=event_id,
+            taxonomy_code=taxonomy, created_at=created_at,
+        )
+    append_outcome_event(
+        db_path, trace_id="recurrence-replacement", event_id="recurrence-correction",
+        event_type="user_correction", source="user", polarity="positive",
+        confidence=.99, taxonomy_code=taxonomy, supersedes_event_id=first.event_id, created_at=5,
+    )
+
+    classifier_inputs = (
+        dict(trace_id="recurrence-replacement", tool_call_id="pytest-pass", tool_name="terminal",
+             tool_arguments={"command": "pytest tests", "background": False}, tool_result={"exit_code": 0}),
+        dict(trace_id="recurrence-replacement", tool_call_id="pytest-fail", tool_name="terminal",
+             tool_arguments={"command": "python -m pytest tests", "background": False}, tool_result={"exit_code": 1}),
+    )
+    classified = [classify_foreground_pytest(**item) for item in classifier_inputs]
+    authorization_findings = 0
+    idempotency_findings = 0
+    persisted = append_producer_outcome_event(db_path, classified[0])
+    retried = append_producer_outcome_event(db_path, classified[0])
+    if retried != persisted:
+        idempotency_findings += 1
+    try:
+        append_producer_outcome_event(db_path, replace(classified[0], producer="foreground_pytest.v2"))
+        authorization_findings += 1
+    except ValueError:
+        pass
+
+    sequential = [classify_foreground_pytest(**item) for item in classifier_inputs]
+    with ThreadPoolExecutor(max_workers=len(classifier_inputs)) as pool:
+        concurrent = list(pool.map(lambda item: classify_foreground_pytest(**item), classifier_inputs))
+    parity_findings = int(sequential != concurrent)
+
+    eligible = evaluate_shadow_recurrence(db_path, limit=limit)
+    append_outcome_event(
+        db_path, trace_id="recurrence-replacement", event_id="recurrence-later-fail",
+        event_type="verification_failed", source="verifier", polarity="negative",
+        confidence=1, created_at=persisted.created_at + 1,
+    )
+    downgraded = evaluate_shadow_recurrence(db_path, limit=limit)
+    append_outcome_event(
+        db_path, trace_id="recurrence-replacement", event_id="recurrence-later-pass",
+        event_type="verification_passed", source="verifier", polarity="positive",
+        confidence=1, created_at=persisted.created_at + 2,
+    )
+    recovered = evaluate_shadow_recurrence(db_path, limit=limit)
+    operator = append_outcome_event(
+        db_path, trace_id="recurrence-operator", event_id="recurrence-operator-event",
+        event_type="assumption_invalidated", source="operator", polarity="neutral",
+        confidence=1, created_at=persisted.created_at + 3,
+    )
+    retract_outcome_event(
+        db_path, source_event_id=operator.event_id, target_event_id="recurrence-negative-b",
+        producer=OPERATOR_RELATION_PRODUCER, created_at=persisted.created_at + 4,
+    )
+    final = evaluate_shadow_recurrence(db_path, limit=limit)
+    coverage, privacy_findings = _validate_recurrence_privacy(
+        final, expected_canary_count=len(set(FIXTURE_PRIVACY_CANARIES)),
+        planted_canary_count=planted_canary_count,
+    )
+    observed_item = _lesson_for(observed, taxonomy)
+    candidate_item = _lesson_for(candidate, taxonomy)
+    eligible_item = _lesson_for(eligible, taxonomy)
+    downgraded_item = _lesson_for(downgraded, taxonomy)
+    recovered_item = _lesson_for(recovered, taxonomy)
+    final_item = _lesson_for(final, taxonomy)
+    section = _count_only_recurrence(final)
+    section.update({
+        "classified_candidate_count": sum(item is not None for item in classified),
+        "authorized_persist_count": 1,
+        "idempotent_retry_count": 1,
+        "authorization_finding_count": authorization_findings,
+        "idempotency_finding_count": idempotency_findings,
+        "parity_finding_count": parity_findings,
+        "privacy_finding_count": privacy_findings,
+        "effective_retraction_count": final["historical_event_count"] - final["effective_event_count"],
+        "observed_transition_count": int(observed_item["state"] == "observed"),
+        "candidate_transition_count": int(candidate_item["state"] == "candidate"),
+        "activation_eligible_transition_count": int(eligible_item["activation_eligible"]),
+        "verified_pair_count": eligible_item["valid_strict_corrected_pair_count"],
+        "downgrade_transition_count": int(not downgraded_item["activation_eligible"]),
+        "recovery_transition_count": int(recovered_item["activation_eligible"]),
+        "privacy_canary_coverage_count": coverage,
+        "expected_canary_coverage_count": len(set(FIXTURE_PRIVACY_CANARIES)),
+        "canary_coverage_ok": coverage == planted_canary_count,
+    })
+    section["ok"] = all((
+        section["authorization_finding_count"] == 0,
+        section["idempotency_finding_count"] == 0,
+        section["parity_finding_count"] == 0,
+        section["privacy_finding_count"] == 0,
+        section["canary_coverage_ok"],
+        eligible_item["activation_eligible"],
+        not downgraded_item["activation_eligible"],
+        recovered_item["activation_eligible"],
+        final_item["activation_eligible"],
+        final["active_lesson_count"] == 0,
+    ))
+    if not section["ok"]:
+        raise RuntimeError("synthetic shadow recurrence evaluation failed closed")
+    return section
+
+
 def run_eval(*, db_path: Path | None = None, limit: int = 100, ready_only: bool = False, min_reward: float = 1.0, max_negative_reward: float = 0.0, task_text: str | None = None, require_ready: bool = True, include_episodes: bool = False) -> dict:
     limit = _bounded_limit(limit)
     min_reward = _finite_float(min_reward, "min_reward")
@@ -173,7 +378,11 @@ def run_eval(*, db_path: Path | None = None, limit: int = 100, ready_only: bool 
     with tempfile.TemporaryDirectory(prefix="hermes-self-improve-eval-") as tmp:
         tmp_path = Path(tmp)
         fixture_db_path = tmp_path / "state.db"
+        recurrence_db_path = tmp_path / "shadow-recurrence-state.db"
         planted_canary_count = make_trace(fixture_db_path)
+        fixture_recurrence = evaluate_synthetic_shadow_recurrence(
+            recurrence_db_path, limit=200, planted_canary_count=planted_canary_count,
+        )
         trace_start = time.perf_counter()
         episodes = list(iter_episodes(db_path=fixture_db_path, limit=10))
         export = export_episodes_jsonl(tmp_path / "episodes.jsonl", db_path=fixture_db_path)
@@ -207,12 +416,15 @@ def run_eval(*, db_path: Path | None = None, limit: int = 100, ready_only: bool 
             and fixture_contrastive["shadow_only"] is True
             and fixture_contrastive["prompt_modified"] is False
         )
+        fixture_contrastive["activation_allowed"] = False
         fixture_contrastive["fixture_requirements_ok"] = fixture_requirements_ok
         fixture_contrastive["ok"] = (
             fixture_contrastive["ok"]
             and fixture_contrastive["privacy_eval_valid"]
             and fixture_requirements_ok
         )
+        if not fixture_contrastive["ok"]:
+            raise RuntimeError("synthetic contrastive shadow evaluation failed closed")
         trace_ms = int((time.perf_counter() - trace_start) * 1000)
 
         code_root = tmp_path / "code"
@@ -235,6 +447,7 @@ def run_eval(*, db_path: Path | None = None, limit: int = 100, ready_only: bool 
             },
             "fixture_replay_eval": fixture_replay,
             "fixture_contrastive_replay_eval": fixture_contrastive,
+            "fixture_shadow_recurrence_eval": fixture_recurrence,
             "semantic_coding": {
                 "file_count": summary["file_count"],
                 "languages": summary["languages"],
@@ -263,6 +476,12 @@ def run_eval(*, db_path: Path | None = None, limit: int = 100, ready_only: bool 
                 corrected_limit=limit,
                 min_positive_reward=min_reward,
                 max_negative_reward=max_negative_reward,
+            )
+            result["contrastive_replay_eval"]["shadow_only"] = True
+            result["contrastive_replay_eval"]["activation_allowed"] = False
+            result["contrastive_replay_eval"]["prompt_modified"] = False
+            result["shadow_recurrence"] = _count_only_recurrence(
+                evaluate_shadow_recurrence(db_path, limit=limit)
             )
         return result
 

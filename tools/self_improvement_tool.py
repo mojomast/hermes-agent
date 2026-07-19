@@ -11,6 +11,7 @@ from agent.episode_retrieval import behavioral_hints_for_task
 from agent.contrastive_episode_retrieval import contrastive_replay_eval, retrieve_contrastive_episodes
 from agent.outcome_events import outcome_summary
 from agent.semantic_code_index import semantic_lookup
+from agent.shadow_recurrence import evaluate_shadow_recurrence
 from agent.training_episodes import default_episode_export_path, episode_summary, export_episodes_jsonl, iter_episodes, replay_eval_episodes
 from hermes_state import DEFAULT_DB_PATH
 from tools.registry import registry, tool_error
@@ -20,13 +21,38 @@ def _json(data: Dict[str, Any]) -> str:
     return json.dumps(data, sort_keys=True)
 
 
+def _shadow_recurrence_count_projection(report: dict[str, Any]) -> dict[str, Any]:
+    """Public tool boundary: aggregate counts and flags, never linkage rows."""
+    count_keys = (
+        "historical_event_count", "effective_event_count", "candidate_lesson_count",
+        "activation_eligible_lesson_count", "active_lesson_count",
+    )
+    projection = {
+        "schema_version": report.get("schema_version"),
+        "policy_version": report.get("policy_version"),
+        "shadow_only": bool(report.get("shadow_only", True)),
+        "activation_allowed": bool(report.get("activation_allowed", False)),
+        "prompt_modified": bool(report.get("prompt_modified", False)),
+        **{key: int(report.get(key, 0) or 0) for key in count_keys},
+        "captured_verifier_counts": {
+            key: int(value) for key, value in report.get("captured_verifier_counts", {}).items()
+            if key in {"historical_pass", "historical_fail", "effective_pass", "effective_fail"}
+        },
+        "privacy": {
+            key: bool(value) for key, value in report.get("privacy", {}).items()
+            if key in {"raw_content_exported", "raw_user_text_read", "raw_prompt_read", "raw_tool_payloads_read"}
+        },
+    }
+    return projection
+
+
 TRAINING_EPISODES_SCHEMA = {
     "name": "training_episodes",
     "description": "Convert Hermes execution traces into privacy-minimized TrainingEpisode projections, summarize rewards, or export JSONL for eval/training.",
     "parameters": {
         "type": "object",
         "properties": {
-            "operation": {"type": "string", "enum": ["summary", "export", "preview", "replay_eval", "behavioral_hints", "outcome_summary", "contrastive_hints", "contrastive_replay_eval"], "description": "Operation to run."},
+            "operation": {"type": "string", "enum": ["summary", "export", "preview", "replay_eval", "behavioral_hints", "outcome_summary", "contrastive_hints", "contrastive_replay_eval", "shadow_recurrence"], "description": "Operation to run."},
             "db_path": {"type": "string", "description": "Optional Hermes state.db path. Defaults to active HERMES_HOME state.db."},
             "output_path": {"type": "string", "description": "JSONL export path. Defaults to ~/.hermes/exports/training_episodes.jsonl."},
             "task_text": {"type": "string", "description": "Operator-supplied task text for shadow inspection categories; raw text is never returned and hints are not automatically applied."},
@@ -83,6 +109,11 @@ def training_episodes(operation: str, db_path: str = "", output_path: str = "", 
             })
         if operation == "outcome_summary":
             return _json({"success": True, "data": outcome_summary(db)})
+        if operation == "shadow_recurrence":
+            # Canonical evaluator uses SQLite mode=ro/query_only. It accepts no
+            # evidence identifiers or activation controls.
+            report = evaluate_shadow_recurrence(db, limit=min(limit, 200))
+            return _json({"success": True, "data": _shadow_recurrence_count_projection(report)})
         if operation == "contrastive_hints":
             return _json({
                 "success": True,

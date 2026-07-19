@@ -75,7 +75,48 @@ def test_training_episodes_schema_exposes_replay_eval_args():
     assert "outcome_summary" in props["operation"]["enum"]
     assert "contrastive_hints" in props["operation"]["enum"]
     assert "contrastive_replay_eval" in props["operation"]["enum"]
+    assert "shadow_recurrence" in props["operation"]["enum"]
     assert "max_negative_reward" in props
+
+
+def test_training_episodes_shadow_recurrence_is_bounded_read_only_and_private(tmp_path, monkeypatch):
+    discover_builtin_tools()
+    captured = {}
+    monkeypatch.setattr(
+        self_improvement_tool,
+        "evaluate_shadow_recurrence",
+        lambda db_path, *, limit: captured.update(db_path=db_path, limit=limit) or {
+            "schema_version": "shadow_recurrence_report.v1",
+            "policy_version": "shadow_lesson_lifecycle.v1",
+            "shadow_only": True,
+            "activation_allowed": False,
+            "prompt_modified": False,
+            "historical_event_count": 9,
+            "effective_event_count": 7,
+            "candidate_lesson_count": 2,
+            "activation_eligible_lesson_count": 1,
+            "active_lesson_count": 0,
+            "captured_verifier_counts": {"effective_pass": 2},
+            "taxonomy_counts": {"wrong_scope": 3},
+            "lessons": [{"lesson_id": "lesson:secret", "taxonomy_code": "wrong_scope"}],
+            "privacy": {"raw_content_exported": False},
+        },
+    )
+    result = json.loads(registry.get_entry("training_episodes").handler({
+        "operation": "shadow_recurrence", "db_path": str(tmp_path / "missing.db"), "limit": 5000,
+    }))
+    assert result["success"] is True
+    assert captured["db_path"] == tmp_path / "missing.db"
+    assert captured["limit"] == 200
+    assert result["data"]["shadow_only"] is True
+    assert result["data"]["activation_allowed"] is False
+    assert result["data"]["prompt_modified"] is False
+    assert result["data"]["historical_event_count"] == 9
+    assert result["data"]["candidate_lesson_count"] == 2
+    blob = json.dumps(result["data"]).lower()
+    for forbidden in ("lesson_id", "lesson:", "taxonomy", "trace", "session", "event_id", "relation_id", "digest", "wrong_scope"):
+        assert forbidden not in blob
+    assert not (tmp_path / "missing.db").exists()
 
 
 def test_training_episodes_contrastive_operations_are_shadow_only(tmp_path):

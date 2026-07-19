@@ -1,5 +1,6 @@
 import json
 import math
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -8,7 +9,11 @@ import pytest
 
 import scripts.evaluate_self_improvement_capabilities as eval_script
 from hermes_state import SessionDB
-from scripts.evaluate_self_improvement_capabilities import FIXTURE_PRIVACY_CANARIES, run_eval
+from scripts.evaluate_self_improvement_capabilities import (
+    FIXTURE_PRIVACY_CANARIES,
+    evaluate_synthetic_shadow_recurrence,
+    run_eval,
+)
 
 
 def test_evaluate_self_improvement_capabilities_includes_fixture_replay_eval():
@@ -46,6 +51,91 @@ def test_evaluate_self_improvement_capabilities_includes_fixture_replay_eval():
     blob = json.dumps(shadow)
     assert not any(canary in blob for canary in FIXTURE_PRIVACY_CANARIES)
     assert shadow["ok"] is True
+
+    recurrence = result["fixture_shadow_recurrence_eval"]
+    assert recurrence["schema_version"] == "shadow_recurrence_eval.v1"
+    assert recurrence["shadow_only"] is True
+    assert recurrence["activation_allowed"] is False
+    assert recurrence["prompt_modified"] is False
+    assert recurrence["classified_candidate_count"] == 2
+    assert recurrence["authorized_persist_count"] == 1
+    assert recurrence["idempotent_retry_count"] == 1
+    assert recurrence["authorization_finding_count"] == 0
+    assert recurrence["idempotency_finding_count"] == 0
+    assert recurrence["parity_finding_count"] == 0
+    assert recurrence["privacy_finding_count"] == 0
+    assert recurrence["historical_event_count"] > recurrence["effective_event_count"]
+    assert recurrence["effective_retraction_count"] == 1
+    assert recurrence["observed_transition_count"] >= 1
+    assert recurrence["candidate_transition_count"] >= 1
+    assert recurrence["activation_eligible_transition_count"] >= 1
+    assert recurrence["verified_pair_count"] >= 1
+    assert recurrence["downgrade_transition_count"] >= 1
+    assert recurrence["recovery_transition_count"] >= 1
+    assert recurrence["privacy_canary_coverage_count"] == len(set(FIXTURE_PRIVACY_CANARIES))
+    assert recurrence["expected_canary_coverage_count"] == len(set(FIXTURE_PRIVACY_CANARIES))
+    assert recurrence["canary_coverage_ok"] is True
+    assert recurrence["ok"] is True
+    recurrence_blob = json.dumps(recurrence)
+    assert not any(canary in recurrence_blob for canary in FIXTURE_PRIVACY_CANARIES)
+    for raw_key in ("trace_id", "event_id", "relation_id", "evidence_digest", "lesson_id"):
+        assert raw_key not in recurrence_blob
+
+
+def test_synthetic_recurrence_fixture_uses_independent_trusted_mistake_roots(tmp_path):
+    db_path = tmp_path / "recurrence.db"
+
+    section = evaluate_synthetic_shadow_recurrence(
+        db_path,
+        limit=200,
+        planted_canary_count=len(set(FIXTURE_PRIVACY_CANARIES)),
+    )
+
+    # Synthetic manual user evidence must satisfy the production gates rather
+    # than relying on verifier/evaluator events or repeated traces/sessions.
+    with sqlite3.connect(db_path) as con:
+        roots = con.execute(
+            "SELECT e.trace_id,t.session_id,e.source,e.polarity,e.confidence,e.taxonomy_code "
+            "FROM outcome_events e JOIN traces t ON t.trace_id=e.trace_id "
+            "WHERE e.event_type='duplicate_proposal' ORDER BY e.event_id"
+        ).fetchall()
+    assert len(roots) == 4
+    assert len({row[0] for row in roots}) == 4
+    assert len({row[1] for row in roots}) == 4
+    assert all(row[2:6] == ("user", "negative", .99, "duplicate_existing_capability") for row in roots)
+    assert section["activation_eligible_transition_count"] == 1
+    assert section["verified_pair_count"] == 1
+    assert section["effective_retraction_count"] == 1
+    assert section["activation_eligible_lesson_count"] == 1
+    assert section["active_lesson_count"] == 0
+
+
+def test_real_db_adds_bounded_count_only_shadow_recurrence(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    SessionDB(db_path).close()
+    calls = []
+    canonical = eval_script.evaluate_shadow_recurrence
+    def fake_recurrence(path, *, limit):
+        calls.append((path, limit))
+        if path != db_path:
+            return canonical(path, limit=limit)
+        return {
+            "schema_version": "shadow_recurrence_report.v1", "policy_version": "shadow_lesson_lifecycle.v1",
+            "shadow_only": True, "activation_allowed": False, "prompt_modified": False,
+            "historical_event_count": 4, "effective_event_count": 3, "candidate_lesson_count": 1,
+            "activation_eligible_lesson_count": 1, "active_lesson_count": 0,
+        }
+    monkeypatch.setattr(eval_script, "evaluate_shadow_recurrence", fake_recurrence)
+    result = run_eval(db_path=db_path, limit=10)
+    assert calls[-1] == (db_path, 10)
+    section = result["shadow_recurrence"]
+    assert section["schema_version"] == "shadow_recurrence_eval.v1"
+    assert section["historical_event_count"] == 4
+    assert section["activation_eligible_lesson_count"] == 1
+    assert "lessons" not in section and "lesson_id" not in json.dumps(section)
+    assert section["shadow_only"] is True
+    assert section["activation_allowed"] is False
+    assert section["prompt_modified"] is False
 
 
 def test_real_db_contrastive_eval_uses_default_task_limits_and_thresholds(tmp_path, monkeypatch):
