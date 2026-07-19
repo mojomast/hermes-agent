@@ -46,6 +46,22 @@ def _shadow_recurrence_count_projection(report: dict[str, Any]) -> dict[str, Any
     return projection
 
 
+def shadow_recurrence_counts() -> str:
+    """Read count-only recurrence metrics from the active profile database."""
+    try:
+        report = evaluate_shadow_recurrence(DEFAULT_DB_PATH, limit=200)
+        return _json({"success": True, "data": _shadow_recurrence_count_projection(report)})
+    except Exception as exc:
+        return tool_error(str(exc))
+
+
+SHADOW_RECURRENCE_COUNTS_SCHEMA = {
+    "name": "shadow_recurrence_counts",
+    "description": "Read count-only correction recurrence metrics from the active Hermes profile. Never exposes lessons, taxonomy, evidence, trace identifiers, or activation controls.",
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+}
+
+
 TRAINING_EPISODES_SCHEMA = {
     "name": "training_episodes",
     "description": "Convert Hermes execution traces into privacy-minimized TrainingEpisode projections, summarize rewards, or export JSONL for eval/training.",
@@ -170,6 +186,15 @@ def semantic_code(project_path: str, operation: str, query: str = "", kind: str 
     except Exception as exc:
         return tool_error(str(exc))
 
+
+registry.register(
+    name="shadow_recurrence_counts",
+    emoji="📊",
+    toolset="self_improvement",
+    schema=SHADOW_RECURRENCE_COUNTS_SCHEMA,
+    handler=lambda args, **kw: shadow_recurrence_counts(),
+    description="Read-only count-only shadow recurrence metrics",
+)
 
 registry.register(
     name="training_episodes",

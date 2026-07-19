@@ -6043,6 +6043,61 @@ class HermesCLI:
                 self._pending_input.put(retry_msg)
         elif canonical == "undo":
             self.undo_last()
+        elif canonical == "correct":
+            import sqlite3
+            from agent.correction_learning_adapter import record_session_correction
+            parts = cmd_original.split()
+            if len(parts) != 2:
+                self._console_print("  Usage: /correct <taxonomy>")
+            elif not getattr(self, "_session_db", None):
+                self._console_print("  Session database not available.")
+            else:
+                try:
+                    event = record_session_correction(
+                        self._session_db, session_id=self.session_id, taxonomy_code=parts[1]
+                    )
+                    self._console_print(f"  Correction recorded in shadow mode: {event.taxonomy_code}")
+                except (ValueError, sqlite3.Error) as exc:
+                    self._console_print(f"  Correction not recorded: {exc}")
+        elif canonical == "lessons":
+            import sqlite3
+            from agent.correction_learning_adapter import (
+                inspect_lesson_events, inspect_lessons, retract_lesson_event,
+            )
+            parts = cmd_original.split()
+            if not getattr(self, "_session_db", None):
+                self._console_print("  Session database not available.")
+            elif len(parts) == 1 or parts[1:] == ["list"]:
+                lessons = inspect_lessons(self._session_db.db_path)
+                if not lessons:
+                    self._console_print("  No observed shadow lessons.")
+                for lesson in lessons:
+                    self._console_print(
+                        f"  {lesson['lesson_id']} {lesson['taxonomy_code']} "
+                        f"state={lesson['state']} roots={lesson['effective_root_count']}"
+                    )
+            elif len(parts) == 3 and parts[1] == "inspect":
+                try:
+                    detail = inspect_lesson_events(self._session_db.db_path, parts[2])
+                    self._console_print(
+                        f"  {detail['lesson']['lesson_id']} {detail['lesson']['taxonomy_code']} "
+                        f"state={detail['lesson']['state']}"
+                    )
+                    for item in detail["events"]:
+                        self._console_print(
+                            f"    {item['event_id']} {item['event_type']} "
+                            f"{item['source']}/{item['polarity']} confidence={item['confidence']}"
+                        )
+                except (ValueError, sqlite3.Error) as exc:
+                    self._console_print(f"  Lesson inspection failed: {exc}")
+            elif len(parts) == 3 and parts[1] == "retract":
+                try:
+                    relation_id = retract_lesson_event(self._session_db.db_path, parts[2])
+                    self._console_print(f"  Shadow evidence retracted: {relation_id}")
+                except (ValueError, sqlite3.Error) as exc:
+                    self._console_print(f"  Retraction failed: {exc}")
+            else:
+                self._console_print("  Usage: /lessons [list|inspect <lesson-id>|retract <event-id>]")
         elif canonical == "branch":
             self._handle_branch_command(cmd_original)
         elif canonical == "save":

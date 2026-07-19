@@ -676,6 +676,31 @@ class SessionDB:
 
         self._execute_write(_do)
 
+    def latest_assistant_trace_id(self, session_id: str) -> Optional[str]:
+        """Return the latest completed trace containing a final assistant answer."""
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT t.trace_id
+                   FROM traces AS t
+                   WHERE t.session_id = ?
+                     AND t.status = 'completed'
+                     AND EXISTS (
+                         SELECT 1 FROM spans AS s
+                         WHERE s.trace_id = t.trace_id
+                           AND s.span_type = 'final_answer'
+                           AND s.status = 'completed'
+                           AND json_extract(s.metadata_json, '$.completed') = 1
+                           AND COALESCE(json_extract(s.metadata_json, '$.interrupted'), 0) = 0
+                           AND COALESCE(json_extract(s.metadata_json, '$.response_len'), 1) > 0
+                     )
+                   ORDER BY t.end_time DESC, t.start_time DESC, t.trace_id DESC
+                   LIMIT 1""",
+                (session_id,),
+            ).fetchone()
+        return str(row["trace_id"]) if row else None
+
     def record_prompt_budget(self, budget_row: Dict[str, Any]) -> str:
         """Persist prompt token breakdown telemetry.
 

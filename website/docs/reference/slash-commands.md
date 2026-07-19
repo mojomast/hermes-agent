@@ -27,6 +27,8 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/save` | Save the current conversation |
 | `/retry` | Retry the last message (resend to agent) |
 | `/undo` | Remove the last user/assistant exchange |
+| `/correct <taxonomy>` | Record an exact allowlisted correction for the previous assistant trace. This structural command is not sent to the model. |
+| `/lessons [list\|inspect <lesson-id>\|retract <event-id>]` | Local CLI operator-only shadow lesson inspection and retraction; never available through messaging gateways. |
 | `/title` | Set a title for the current session (usage: /title My Session Name) |
 | `/compress [focus topic]` | Manually compress conversation context (flush memories + summarize). Optional focus topic narrows what the summary preserves. |
 | `/rollback` | List or restore filesystem checkpoints (usage: /rollback [number]) |
@@ -129,6 +131,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/fast [normal\|fast\|status]` | Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode. |
 | `/retry` | Retry the last message. |
 | `/undo` | Remove the last exchange. |
+| `/correct <taxonomy>` | Record an exact allowlisted correction for the previous assistant trace without invoking the model. |
 | `/sethome` (alias: `/set-home`) | Mark the current chat as the platform home channel for deliveries. |
 | `/compress [focus topic]` | Manually compress conversation context. Optional focus topic narrows what the summary preserves. |
 | `/title [name]` | Set or show the session title. |

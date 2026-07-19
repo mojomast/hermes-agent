@@ -7,14 +7,17 @@ from agent.tracing import TraceRecorder, hash_user_message
 from hermes_state import SessionDB
 from model_tools import discover_builtin_tools
 from tools.registry import registry
-from toolsets import resolve_toolset
+from toolsets import _HERMES_CORE_TOOLS, resolve_toolset
 
 
 def test_self_improvement_tools_register_and_resolve():
     discover_builtin_tools()
     assert registry.get_entry("training_episodes") is not None
+    assert registry.get_entry("shadow_recurrence_counts") is not None
     assert registry.get_entry("semantic_code") is not None
     assert "training_episodes" in resolve_toolset("self_improvement")
+    assert "shadow_recurrence_counts" in _HERMES_CORE_TOOLS
+    assert "training_episodes" not in _HERMES_CORE_TOOLS
     assert "semantic_code" in resolve_toolset("coding")
     assert "training_episodes" in resolve_toolset("full") or "training_episodes" in resolve_toolset("all")
 
@@ -77,6 +80,25 @@ def test_training_episodes_schema_exposes_replay_eval_args():
     assert "contrastive_replay_eval" in props["operation"]["enum"]
     assert "shadow_recurrence" in props["operation"]["enum"]
     assert "max_negative_reward" in props
+
+
+def test_shadow_recurrence_counts_tool_has_no_arguments_and_is_count_only(tmp_path, monkeypatch):
+    discover_builtin_tools()
+    db_path = tmp_path / "missing.db"
+    monkeypatch.setattr(self_improvement_tool, "DEFAULT_DB_PATH", db_path)
+    entry = registry.get_entry("shadow_recurrence_counts")
+    assert entry.schema["parameters"] == {
+        "type": "object", "properties": {}, "additionalProperties": False
+    }
+    result = json.loads(entry.handler({"db_path": "/tmp/ignored", "operation": "export"}))
+    assert result["success"] is True
+    assert result["data"]["shadow_only"] is True
+    assert result["data"]["activation_allowed"] is False
+    assert result["data"]["prompt_modified"] is False
+    blob = json.dumps(result["data"]).lower()
+    for forbidden in ("lesson_id", "taxonomy", "trace", "session", "event_id", "relation_id", "digest"):
+        assert forbidden not in blob
+    assert not db_path.exists()
 
 
 def test_training_episodes_shadow_recurrence_is_bounded_read_only_and_private(tmp_path, monkeypatch):

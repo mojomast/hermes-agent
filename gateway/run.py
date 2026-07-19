@@ -3719,6 +3719,9 @@ class GatewayRunner:
         
         if canonical == "undo":
             return await self._handle_undo_command(event)
+
+        if canonical == "correct":
+            return await self._handle_correct_command(event)
         
         if canonical == "sethome":
             return await self._handle_set_home_command(event)
@@ -5971,6 +5974,27 @@ class GatewayRunner:
         
         preview = removed_msg[:40] + "..." if len(removed_msg) > 40 else removed_msg
         return f"↩️ Undid {removed_count} message(s).\nRemoved: \"{preview}\""
+
+    async def _handle_correct_command(self, event: MessageEvent) -> str:
+        """Record one explicit structural correction without invoking the model."""
+        import sqlite3
+        from agent.correction_learning_adapter import record_session_correction
+
+        args = event.get_command_args().strip().split()
+        if len(args) != 1:
+            return "Usage: /correct <taxonomy>"
+        if self._session_db is None:
+            return "Correction store is unavailable."
+        session_entry = self.session_store.get_or_create_session(event.source)
+        try:
+            outcome = record_session_correction(
+                self._session_db,
+                session_id=session_entry.session_id,
+                taxonomy_code=args[0],
+            )
+        except (ValueError, sqlite3.Error) as exc:
+            return f"Correction not recorded: {exc}"
+        return f"Correction recorded in shadow mode: `{outcome.taxonomy_code}`"
     
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""

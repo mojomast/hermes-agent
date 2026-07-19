@@ -125,7 +125,7 @@ All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes
 
 ### Correction-aware shadow learning (release branch)
 
-This integrated Hermes branch can persist structural traces, capture narrowly authorized foreground-pytest outcomes, and report correction-aware contrastive and recurrence metrics. It remains evaluation-only: it does not train a standalone model, adapt weights, modify prompts, or activate lessons. See **[Correction-aware shadow learning](docs/CORRECTION_AWARE_LEARNING.md)** for the producer trust boundary, privacy contract, lifecycle policy, operator interface, current fixture metrics, limitations, and exact reproduction commands.
+This integrated Hermes branch persists structural traces, automatically captures foreground-pytest outcomes, accepts exact taxonomy corrections with `/correct <taxonomy>`, provides local operator-only `/lessons` inspection/retraction, and exposes a read-only count-only recurrence tool to the model. It remains evaluation-only: it does not adapt weights, modify prompts, or activate lessons. See **[Correction-aware shadow learning](docs/CORRECTION_AWARE_LEARNING.md)** for the producer trust boundary, privacy contract, lifecycle policy, command reference, current fixture metrics, limitations, and exact reproduction commands.
 
 ---
 

@@ -55,8 +55,9 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
-    # Self-improvement + semantic coding
-    "training_episodes", "semantic_code",
+    # Shadow-only recurrence metrics + semantic coding. Training export/replay
+    # remains opt-in via the self_improvement toolset, never core/model-default.
+    "shadow_recurrence_counts", "semantic_code",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)

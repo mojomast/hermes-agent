@@ -2,7 +2,7 @@
 
 ## Release status and positioning
 
-This branch adds an **integrated Hermes Agent shadow-evaluation substrate**. It is not a standalone model-training package and it does not update model weights, prompts, memories, skills, or policies. Hermes can now persist structural execution traces, automatically capture a narrowly authorized class of verifier outcomes, represent explicit corrections and retractions, retrieve contrastive episodes for operator inspection, and calculate recurrence/lifecycle metrics. Every generated lesson remains inactive.
+This branch adds an **integrated Hermes Agent shadow-evaluation substrate**. It is not a standalone model-training package and it does not update model weights, prompts, memories, skills, or policies. Hermes persists structural execution traces, automatically captures narrowly authorized foreground-pytest outcomes, accepts an explicit taxonomy-only correction command, provides a local operator control plane for lesson inspection/retraction, and exposes count-only recurrence metrics to the model. Every generated lesson remains inactive.
 
 The capability is correction-aware because corrected attempts can be linked to the original failed evidence and accepted only with a later strict verifier pass. It is shadow learning because the resulting matches, hint text, and lesson states are reports only:
 
@@ -28,7 +28,7 @@ Non-goals for this release include:
 - active adaptation or automatic application of a hint;
 - prompt assembly, prompt mutation, or retrieval injected into a model call;
 - model fine-tuning, online RL, or weight updates;
-- deriving corrections, retractions, or replacements from user prose;
+- deriving corrections, retractions, or replacements from free-form user prose (the exact `/correct <taxonomy>` control command is structural, not prose interpretation);
 - background verification or background-review capture;
 - parsing arbitrary test runners, shell pipelines, CI logs, or pytest output text;
 - treating a successful command exit as proof beyond the narrow direct-pytest contract.
@@ -75,6 +75,9 @@ Capture is skipped on interruption and for background-review origins/agents. Bac
 | Write path | Intended caller | Allowed output | Enforcement |
 |---|---|---|---|
 | `classify_foreground_pytest` → `append_producer_outcome_event` | Normal Hermes runtime | Strict pytest pass/fail verifier events only | **Runtime enforced** by frozen candidate structure, exact producer `foreground_pytest.v1`, deterministic ID, fixed fields, trace existence, and append-only DB constraints. |
+| `/correct <taxonomy>` → `record_session_correction` | Authorized CLI/gateway user | One negative `user_correction` on the latest completed assistant trace in the same session | Exact one-token allowlist, deterministic idempotency, fixed source/polarity/confidence, no free-form text, no model call, and no prompt/history write. |
+| `/lessons list|inspect|retract` | Local CLI operator only | Bounded allowlisted lesson state/evidence handles or one atomic structural retraction | `cli_only`; absent from gateway commands and model tools. Retraction accepts only an opaque event ID and atomically appends an operator event plus relation. |
+| `shadow_recurrence_counts` | Model tool | Global count-only recurrence/verifier metrics and fixed safety flags | No arguments, no arbitrary DB path, read-only SQLite, no taxonomy/lesson/evidence/linkage identifiers, and no write/activation operation. |
 | `append_outcome_event` | Trusted fixture/operator/internal code | Any allowlisted event/source/polarity/taxonomy combination | Validation and append-only constraints, but **not runtime producer authorization**. It is an internal construction API and must not be exposed as proof that arbitrary claimed `source="user"` or `source="verifier"` is authenticated. |
 | `append_outcome_event_relation` | Trusted structural operator/internal code | `corrects`, `retracts`, or `replaces` | Exact producer `structural_operator.v1` is checked in Python and by a SQLite trigger. Endpoints must exist and cycles are rejected. |
 | `retract_outcome_event` | Trusted structural operator/internal code | A `retracts` relation | Same producer requirement, plus the relation's source event must itself have `source="operator"`. No reason/prose argument exists. |
@@ -154,9 +157,9 @@ The synthetic evaluation plants ten distinct canaries under raw-looking metadata
 
 `retrieve_contrastive_episodes` returns `contrastive_episode_retrieval.v1`: allowlisted task categories; bounded positive, negative, and corrected matches; fixed-template shadow hints; episode count; privacy declarations; latency; and shadow flags. Matches contain a truncated SHA-256 pseudonym, score/reward, matched structural features, safe tool names, allowlisted outcome/taxonomy names, and event count. Raw task text is used only for category classification and is not returned. `contrastive_replay_eval.v1` converts this to counts, recurrence/taxonomy aggregates, privacy findings, coverage provenance, latency, and `ok`.
 
-### Public operator count-only recurrence packet
+### Public model count-only recurrence packet
 
-The `training_episodes` tool deliberately removes lessons, lesson IDs, taxonomies, trace/session/event/relation IDs, and digests. Its `shadow_recurrence` data object contains only:
+The model-visible `shadow_recurrence_counts` tool has an empty argument schema and always reads the active profile database. It deliberately removes lessons, lesson IDs, taxonomies, trace/session/event/relation IDs, and digests. Its data object contains only:
 
 - `schema_version`, `policy_version`;
 - `shadow_only`, `activation_allowed`, `prompt_modified`;
@@ -166,21 +169,29 @@ The `training_episodes` tool deliberately removes lessons, lesson IDs, taxonomie
 
 The CLI eval's optional real-database `shadow_recurrence` section is independently projected to count-only `shadow_recurrence_eval.v1` and omits verifier/privacy subobjects. Synthetic fixture sections contain additional test counters but no store linkage.
 
-## Operator usage
+## User and operator usage
 
-Enable the `self_improvement` toolset and call the registered `training_episodes` tool. For a private, read-only recurrence summary:
+Record a correction immediately after an assistant answer:
 
-```json
-{
-  "operation": "shadow_recurrence",
-  "db_path": "~/.hermes/state.db",
-  "limit": 100
-}
+```text
+/correct wrong_scope
 ```
 
-`limit` is capped to 200 at this operation. It controls the canonical lesson projection before the tool removes lesson rows; aggregate counts remain global.
+The payload must be exactly one taxonomy code from the vocabulary table. Hermes resolves the latest persisted trace with a completed `final_answer` span in the same session, writes one deterministic negative correction, and returns an acknowledgement. The command itself, arbitrary prose, prompt text, and assistant output are not stored in the Outcome Event and are never sent to the model. Repeating the same taxonomy for the same trace is idempotent. With no eligible prior trace, the command fails closed.
 
-For operator-only contrastive inspection:
+Local operators can inspect and retract structural evidence without exposing that control plane to gateways or the model:
+
+```text
+/lessons list
+/lessons inspect lesson:<opaque-id>
+/lessons retract explicit-correction:<opaque-id>
+```
+
+`list` and `inspect` return only allowlisted taxonomy/state/count fields and opaque evidence handles; they never return prompts, user text, tool payloads, span metadata, evidence digests, or trace/session IDs. `retract` accepts one exact event handle and atomically appends an operator control event plus `retracts` relation. Historical evidence remains immutable. This is a local-process operator boundary, not protection against a host administrator with code or SQLite access.
+
+The model-visible `shadow_recurrence_counts` tool needs no arguments and has no write, inspection, export, task-text, DB-path, activation, or retraction operation. The broader `training_episodes` tool remains available only through the explicitly enabled `self_improvement` toolset for offline/operator evaluation; it is no longer a core/default model tool.
+
+For operator-only contrastive inspection with that opt-in toolset:
 
 ```json
 {
@@ -259,7 +270,7 @@ The persistence order is trace first, queued Outcome Events second, recorder mar
 
 This release intentionally stops before activation. At minimum, an active-adaptation release still needs:
 
-1. **Authenticated evidence producers.** Add explicit, reviewed runtime producers for user correction/rejection and broader verifiers; do not expose the permissive fixture API as authentication.
+1. **Authenticated evidence producers.** The exact taxonomy-only correction command is now a reviewed runtime producer; broader correction/rejection verifiers and stronger identity binding still require explicit producer designs. Do not expose the permissive fixture API as authentication.
 2. **Prose and injection design.** If user prose is ever interpreted, define provenance, quotation/forwarding handling, prompt-injection resistance, confidence calibration, consent, and appeal/retraction workflows. No such detector exists today.
 3. **Durable delivery.** Replace or supplement the process-local lossy queue with transactional/outbox semantics, bounded durable retention, observability, and recovery tests.
 4. **Activation governance.** Add an independently authorized approval/promotion path, rollback/kill switch, version pinning, audit trail, rejection state, expiry, and conflict resolution. “Activation-eligible” alone must never activate.
@@ -279,6 +290,7 @@ From the repository root, with project dependencies installed, run the focused r
 ```bash
 python -m pytest -q \
   tests/agent/test_contrastive_episode_retrieval.py \
+  tests/agent/test_correction_learning_adapter.py \
   tests/agent/test_outcome_events.py \
   tests/agent/test_outcome_event_relations.py \
   tests/agent/test_shadow_outcome_capture.py \
@@ -286,6 +298,7 @@ python -m pytest -q \
   tests/agent/test_tracing.py \
   tests/agent/test_training_episodes.py \
   tests/run_agent/test_shadow_outcome_integration.py \
+  tests/cli/test_correction_commands.py \
   tests/test_evaluate_self_improvement_capabilities.py \
   tests/test_trace_persistence.py \
   tests/tools/test_self_improvement_tool.py
