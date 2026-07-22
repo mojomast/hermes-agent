@@ -122,8 +122,9 @@ from agent.shadow_outcome_capture import classify_foreground_pytest
 from agent.outcome_events import append_producer_outcome_event
 from agent.behavioral_adaptation import (
     AdaptationDecision,
+    MAX_EXPOSURE_COUNT,
     decide_behavioral_adaptation,
-    parse_behavioral_adaptation_config,
+    effective_behavioral_adaptation_config,
 )
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 
@@ -907,6 +908,7 @@ class AIAgent:
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
         persist_session: bool = True,
+        behavioral_adaptation_foreground: bool = False,
     ):
         """
         Initialize the AI Agent.
@@ -1588,13 +1590,16 @@ class AIAgent:
             _agent_cfg = _load_agent_config()
         except Exception:
             _agent_cfg = {}
-        self._behavioral_adaptation_config = parse_behavioral_adaptation_config(
-            _agent_cfg.get("behavioral_adaptation") if isinstance(_agent_cfg, dict) else None
+        self._behavioral_adaptation_config = effective_behavioral_adaptation_config(
+            _agent_cfg,
+            ignore_user_config=bool(os.environ.get("HERMES_IGNORE_USER_CONFIG")),
         )
-        # parent_session_id identifies delegated and background-review agents;
-        # persist_session=False identifies other ephemeral helper flows.
-        self._behavioral_adaptation_foreground = parent_session_id is None and persist_session
+        # This capability boundary is explicit and defaults closed. Only known
+        # interactive/API user-turn constructors opt in; persistence, platform,
+        # or absence of a parent is not sufficient to infer foreground status.
+        self._behavioral_adaptation_foreground = behavioral_adaptation_foreground is True
         self._behavioral_adaptation_decision = AdaptationDecision(None, {})
+        self._behavioral_adaptation_span = None
         # Cache only the derived auxiliary compression context override that is
         # needed later by the startup feasibility check.  Avoid exposing a
         # broad pseudo-public config object on the agent instance.
@@ -3403,10 +3408,8 @@ class AIAgent:
 
     def _decide_behavioral_adaptation_for_turn(self, task_text: str) -> AdaptationDecision:
         """Make and record the single privacy-safe adaptation decision for a turn."""
-        from hermes_state import DEFAULT_DB_PATH
-
         session_db = getattr(self, "_session_db", None)
-        db_path = getattr(session_db, "db_path", None) or DEFAULT_DB_PATH
+        db_path = getattr(session_db, "db_path", None)
         decision = decide_behavioral_adaptation(
             config=getattr(self, "_behavioral_adaptation_config", None),
             session_id=getattr(self, "session_id", "") or "",
@@ -3415,28 +3418,58 @@ class AIAgent:
             foreground=bool(getattr(self, "_behavioral_adaptation_foreground", False)),
         )
         self._behavioral_adaptation_decision = decision
+        self._behavioral_adaptation_span = None
         tracer = active_tracer(self)
         if tracer is not None:
             with tracer.span(
                 "policy_decision", "behavioral_adaptation_decision",
                 metadata=decision.telemetry,
-            ):
-                pass
+            ) as span:
+                self._behavioral_adaptation_span = span
         return decision
 
+    def _update_behavioral_adaptation_span(self) -> None:
+        """Refresh the bounded decision span after each request assembly."""
+        span = getattr(self, "_behavioral_adaptation_span", None)
+        decision = getattr(self, "_behavioral_adaptation_decision", None)
+        if span is not None and isinstance(decision, AdaptationDecision):
+            try:
+                span.metadata_json = json.dumps(decision.telemetry, sort_keys=True)
+            except Exception:
+                pass
+
     def _effective_system_for_api(self, stable_system_prompt: str) -> str:
-        """Assemble API-only system additions without mutating their sources."""
+        """Assemble API-only system additions and record actual application."""
         parts = [stable_system_prompt or ""]
         caller_ephemeral = getattr(self, "ephemeral_system_prompt", None)
         if caller_ephemeral:
             parts.append(caller_ephemeral)
-        # Runtime kill switch is intentionally checked for every request, not
-        # merely when the once-per-turn policy decision is made.
-        kill_value = os.environ.get("HERMES_DISABLE_BEHAVIORAL_ADAPTATION", "")
-        killed = kill_value.strip().lower() in {"1", "true", "yes", "on"}
+
         decision = getattr(self, "_behavioral_adaptation_decision", None)
-        if not killed and isinstance(decision, AdaptationDecision) and decision.suffix:
-            parts.append(decision.suffix)
+        if isinstance(decision, AdaptationDecision):
+            telemetry = decision.telemetry
+            current_requests = telemetry.get("request_count", 0)
+            if type(current_requests) is not int or current_requests < 0:
+                current_requests = 0
+            telemetry["request_count"] = min(MAX_EXPOSURE_COUNT, current_requests + 1)
+
+            # Missing and explicit false tokens permit adaptation. Any other
+            # non-empty value disables it, so malformed emergency input is safe.
+            kill_value = os.environ.get("HERMES_DISABLE_BEHAVIORAL_ADAPTATION", "")
+            killed = bool(kill_value.strip()) and kill_value.strip().lower() not in {
+                "0", "false", "no", "off",
+            }
+            if not killed and decision.suffix:
+                parts.append(decision.suffix)
+                current_applications = telemetry.get("application_count", 0)
+                if type(current_applications) is not int or current_applications < 0:
+                    current_applications = 0
+                telemetry["application_count"] = min(
+                    MAX_EXPOSURE_COUNT, current_applications + 1,
+                )
+                telemetry["applied"] = True
+                telemetry["activated"] = True
+            self._update_behavioral_adaptation_span()
         return "\n\n".join(part for part in parts if part).strip()
 
     def _queue_shadow_outcome(

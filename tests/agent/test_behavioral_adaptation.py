@@ -6,6 +6,7 @@ import pytest
 from agent.behavioral_adaptation import (
     MAX_SUFFIX_CHARS,
     decide_behavioral_adaptation,
+    effective_behavioral_adaptation_config,
     parse_behavioral_adaptation_config,
     treatment_for_session,
 )
@@ -24,6 +25,26 @@ def _report(eligible=True, taxonomy="wrong_scope"):
             "eligibility_minimum_sessions": 2,
             "strict_corrected_pair_required": True,
         },
+        "shadow_only": True,
+        "activation_allowed": False,
+        "prompt_modified": False,
+        "historical_event_count": 3,
+        "effective_event_count": 3,
+        "event_counts": {"historical": 3, "effective": 3},
+        "captured_verifier_counts": {
+            "historical_pass": 1, "historical_fail": 0,
+            "effective_pass": 1, "effective_fail": 0,
+        },
+        "captured_verifier_event_counts": {
+            "historical": {"verification_passed": 1, "verification_failed": 0},
+            "effective": {"verification_passed": 1, "verification_failed": 0},
+        },
+        "taxonomy_counts": {taxonomy: 3},
+        "recurrence_counts": {taxonomy: 3},
+        "taxonomy_states": {taxonomy: "activation_eligible" if eligible else "candidate"},
+        "candidate_lesson_count": 1,
+        "activation_eligible_lesson_count": int(eligible),
+        "active_lesson_count": 0,
         "privacy": {
             "raw_content_exported": False,
             "raw_user_text_read": False,
@@ -36,7 +57,7 @@ def _report(eligible=True, taxonomy="wrong_scope"):
             "pseudonymous_lesson_ids_linkable_across_reports": True,
         },
         "lessons": [{
-            "lesson_id": "CANARY_PRIVATE_STORE_ID",
+            "lesson_id": "lesson:11111111-1111-5111-8111-111111111111",
             "taxonomy_code": taxonomy,
             "lifecycle_state": 3 if eligible else 2,
             "state": "activation_eligible" if eligible else "candidate",
@@ -44,6 +65,14 @@ def _report(eligible=True, taxonomy="wrong_scope"):
             "session_count": 2,
             "valid_strict_corrected_pair_count": 1 if eligible else 0,
             "activation_eligible": eligible,
+            "historical_event_count": 3,
+            "effective_event_count": 3,
+            "historical_root_count": 3,
+            "active": False,
+            "rejected": False,
+            "shadow_only": True,
+            "activation_allowed": False,
+            "prompt_modified": False,
         }],
     }
 
@@ -85,6 +114,12 @@ def test_config_is_strict_default_off_and_literal_true_only():
     assert cfg.enabled is True and cfg.valid is True
 
 
+def test_ignore_user_config_forces_default_off_even_if_loaded_config_enabled():
+    loaded = {"behavioral_adaptation": {"enabled": True, "treatment_percent": 100}}
+    assert effective_behavioral_adaptation_config(loaded, ignore_user_config=True).enabled is False
+    assert effective_behavioral_adaptation_config(loaded, ignore_user_config=False).enabled is True
+
+
 def test_treatment_control_assignment_is_deterministic_and_stable():
     values = [treatment_for_session("stable-session", 50) for _ in range(10)]
     assert len(set(values)) == 1
@@ -101,7 +136,8 @@ def test_only_relevant_activation_eligible_strict_pair_generates_one_fixed_hint(
         task_text="The prior answer was wrong; confirm the requested scope", db_path=tmp_path / "x.db",
         foreground=True,
     )
-    assert decision.suffix and decision.telemetry["activated"] is True
+    assert decision.suffix and decision.telemetry["selected_for_treatment"] is True
+    assert decision.telemetry["activated"] is False
     assert decision.telemetry["taxonomy_code"] == "wrong_scope"
     assert len(decision.suffix) <= MAX_SUFFIX_CHARS
     assert "CANARY_PRIVATE_STORE_ID" not in json.dumps(decision.as_dict())
@@ -150,6 +186,85 @@ def test_foreground_only_and_no_raw_text_or_identifiers_in_decision(monkeypatch,
     blob = json.dumps(decision.as_dict())
     assert decision.suffix is None and decision.telemetry["reason"] == "non_foreground"
     assert canary not in blob and "CANARY_SESSION_ID" not in blob
+
+
+def test_treatment_and_control_compute_identical_counterfactual_eligibility(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        "agent.behavioral_adaptation.evaluate_shadow_recurrence",
+        lambda path: calls.append(path) or _report(),
+    )
+    common = dict(session_id="s", task_text="wrong scope", db_path=tmp_path / "x", foreground=True)
+    control = decide_behavioral_adaptation(
+        **common, config={"enabled": True, "treatment_percent": 0},
+    )
+    treatment = decide_behavioral_adaptation(
+        **common, config={"enabled": True, "treatment_percent": 100},
+    )
+    assert len(calls) == 2
+    for key in ("eligible", "taxonomy_code", "privacy_contract_valid"):
+        assert control.telemetry[key] == treatment.telemetry[key]
+    assert control.suffix is None and treatment.suffix
+    assert control.telemetry["selected_for_treatment"] is False
+    assert treatment.telemetry["selected_for_treatment"] is True
+    assert treatment.telemetry["applied"] is False
+    assert treatment.telemetry["activated"] is False
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda report: report.update({"raw_user_text": "CANARY_RAW"}),
+    lambda report: report.update({"shadow_only": False}),
+    lambda report: report.update({"activation_allowed": True}),
+    lambda report: report.update({"prompt_modified": True}),
+    lambda report: report["lessons"][0].update({"raw_prompt": "CANARY_RAW"}),
+    lambda report: report["lessons"][0].update({"active": True}),
+    lambda report: report["lessons"][0].update({"taxonomy_code": []}),
+    lambda report: report["lessons"][0].update({"lesson_id": "CANARY_RAW"}),
+    lambda report: report.update({"taxonomy_counts": {"CANARY_RAW": 3}}),
+    lambda report: report.update({"event_counts": {"historical": 3, "effective": 3, "raw": "CANARY_RAW"}}),
+])
+def test_report_validator_rejects_raw_undeclared_conflicting_and_wrong_types_without_crash(
+    monkeypatch, tmp_path, mutation,
+):
+    report = _report()
+    mutation(report)
+    monkeypatch.setattr("agent.behavioral_adaptation.evaluate_shadow_recurrence", lambda _: report)
+    decision = decide_behavioral_adaptation(
+        config={"enabled": True, "treatment_percent": 100}, session_id="s",
+        task_text="wrong scope", db_path=tmp_path / "x", foreground=True,
+    )
+    assert decision.suffix is None
+    assert decision.telemetry["reason"] == "privacy_contract_invalid"
+    assert "CANARY_RAW" not in json.dumps(decision.as_dict())
+
+
+def test_classification_exception_fails_closed_without_raw_error(monkeypatch, tmp_path):
+    monkeypatch.setattr("agent.behavioral_adaptation.evaluate_shadow_recurrence", lambda _: _report())
+    monkeypatch.setattr(
+        "agent.behavioral_adaptation.task_frame_from_text",
+        lambda _: (_ for _ in ()).throw(RuntimeError("CANARY_CLASSIFICATION_SECRET")),
+    )
+    decision = decide_behavioral_adaptation(
+        config={"enabled": True, "treatment_percent": 100}, session_id="s",
+        task_text="wrong scope", db_path=tmp_path / "x", foreground=True,
+    )
+    assert decision.suffix is None
+    assert decision.telemetry["reason"] == "classification_unavailable"
+    assert "CANARY_CLASSIFICATION_SECRET" not in json.dumps(decision.as_dict())
+
+
+@pytest.mark.parametrize("session_id,db_path", [("", "db"), ("s", None)])
+def test_missing_session_or_db_suppresses_without_evidence_read(monkeypatch, session_id, db_path):
+    monkeypatch.setattr(
+        "agent.behavioral_adaptation.evaluate_shadow_recurrence",
+        lambda _: pytest.fail("must not read global or any recurrence database"),
+    )
+    decision = decide_behavioral_adaptation(
+        config={"enabled": True, "treatment_percent": 100}, session_id=session_id,
+        task_text="wrong scope", db_path=db_path, foreground=True,
+    )
+    assert decision.suffix is None
+    assert decision.telemetry["reason"] == "missing_session_context"
 
 
 def test_real_retraction_and_later_failure_invalidate_strict_pair(tmp_path):

@@ -9887,6 +9887,7 @@ class GatewayRunner:
                     provider_data_collection=pr.get("data_collection"),
                     session_id=session_id,
                     platform=platform_key,
+                    behavioral_adaptation_foreground=True,
                     user_id=source.user_id,
                     user_name=source.user_name,
                     chat_id=source.chat_id,

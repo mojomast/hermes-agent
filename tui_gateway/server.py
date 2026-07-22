@@ -1293,6 +1293,7 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
         service_tier=_load_service_tier(),
         enabled_toolsets=_load_enabled_toolsets(),
         platform="tui",
+        behavioral_adaptation_foreground=True,
         session_id=session_id or key,
         session_db=_get_db(),
         ephemeral_system_prompt=system_prompt or None,

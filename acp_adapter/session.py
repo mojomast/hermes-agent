@@ -569,6 +569,7 @@ class SessionManager:
             ),
             "quiet_mode": True,
             "session_id": session_id,
+            "behavioral_adaptation_foreground": True,
             "model": model or default_model,
         }
 
