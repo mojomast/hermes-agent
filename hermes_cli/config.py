@@ -390,6 +390,14 @@ DEFAULT_CONFIG = {
         # bot is dead and /restart.
         "gateway_notify_interval": 180,
     },
+
+    # Correction-aware Behavioral Hint Adaptation Layer. Disabled by default;
+    # activation requires the literal boolean true plus canonical eligible
+    # structural evidence. Keep this off until an operator explicitly opts in.
+    "behavioral_adaptation": {
+        "enabled": False,
+        "treatment_percent": 50,
+    },
     
     "terminal": {
         "backend": "local",

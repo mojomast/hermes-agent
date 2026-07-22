@@ -2,7 +2,7 @@
 
 ## Release status and positioning
 
-This branch adds an **integrated Hermes Agent shadow-evaluation substrate**. It is not a standalone model-training package and it does not update model weights, prompts, memories, skills, or policies. Hermes persists structural execution traces, automatically captures narrowly authorized foreground-pytest outcomes, accepts an explicit taxonomy-only correction command, provides a local operator control plane for lesson inspection/retraction, and exposes count-only recurrence metrics to the model. Every generated lesson remains inactive.
+This branch adds an **integrated Hermes Agent correction-aware substrate** plus a default-off Behavioral Hint Adaptation Layer. It is not a standalone model-training package and it never updates model weights, memories, skills, or durable policies. Hermes persists structural Execution Traces, captures narrowly authorized Outcome Events, accepts an explicit taxonomy-only correction command, provides a local operator control plane for lesson inspection/retraction, and exposes count-only recurrence metrics. Shadow reports remain inactive; a separately enabled adaptation policy may apply one fixed source-owned Behavioral Hint ephemerally to an eligible foreground turn.
 
 The capability is correction-aware because corrected attempts can be linked to the original failed evidence and accepted only with a later strict verifier pass. It is shadow learning because the resulting matches, hint text, and lesson states are reports only:
 
@@ -12,6 +12,26 @@ The capability is correction-aware because corrected attempts can be linked to t
 - `prompt_modified` is `false`.
 
 These declarations describe this implementation boundary; they are not a claim that arbitrary data in a Hermes database is safe.
+
+## Behavioral Hint Adaptation Layer: disabled, control, and eligible treatment
+
+The Adaptation Layer is **disabled by default**. Missing config, `enabled: false`, string values such as `"true"`, unknown keys, invalid percentages, and read/schema/privacy failures all produce no suffix. The checked-in defaults do not enable it.
+
+An operator can explicitly opt into measurement with this user-config example (this is documentation, not active repository configuration):
+
+```yaml
+behavioral_adaptation:
+  enabled: true          # must be the literal YAML boolean
+  treatment_percent: 50 # integer from 0 through 100
+```
+
+Assignment to treatment or control is a deterministic, version-salted function of the session identifier. It is stable within and across turns for a session. Control turns never modify the request. Treatment is still gated by all canonical `activation_eligible` requirements: three effective roots, two sessions, and a currently valid strict Corrected Pair. Retraction or a later verifier failure removes eligibility. The current task must also map to that taxonomy. The layer then appends at most one taxonomy-keyed, source-owned hint (maximum 512 characters) to an API-only system-prompt copy. It does not use generic episode-retrieval prose.
+
+The decision is made once per turn and reused across tool iterations. It runs only for a persisted foreground agent, never subagents, ephemeral helpers, or background review. Neither the cached system prompt, stored messages, caller-provided ephemeral prompt, raw task text, nor identifiers are modified or persisted. Existing TraceRecorder spans receive only a bounded decision schema (cohort, reason, eligibility/activation booleans, allowlisted taxonomy, and character count); there is no new database table.
+
+Set `HERMES_DISABLE_BEHAVIORAL_ADAPTATION=true` to stop suffix application immediately. The kill switch is checked at each model-request assembly even after a turn decision has been made.
+
+This treatment/control instrumentation supports measurement; it **does not establish or claim causal improvement**. Shadow contrastive packets remain diagnostic and do not themselves activate hints.
 
 ## Task frame and non-goals
 
@@ -25,8 +45,8 @@ This task framing is deliberately small. It is **not** semantic intent recogniti
 
 Non-goals for this release include:
 
-- active adaptation or automatic application of a hint;
-- prompt assembly, prompt mutation, or retrieval injected into a model call;
+- adaptation from shadow contrastive/episode packets or arbitrary stored text;
+- more than one bounded source-owned hint, or durable prompt mutation;
 - model fine-tuning, online RL, or weight updates;
 - deriving corrections, retractions, or replacements from free-form user prose (the exact `/correct <taxonomy>` control command is structural, not prose interpretation);
 - background verification or background-review capture;
@@ -47,7 +67,7 @@ Non-goals for this release include:
 | **strict corrected pair** | A positive, high-confidence user `user_correction` that supersedes a different trace's effective, negative, high-confidence user event with the same taxonomy, plus the latest qualifying verifier result at or after the correction being `verification_passed`. |
 | **effective event** | An event that survives the finite-DAG suppression rules described below. Historical queries still include every immutable row. |
 | **contrastive match** | A privacy-minimized positive, negative, or corrected episode selected for an operator's task frame. Corrected episodes can also be positive when ready, above the reward threshold, and strictly verified. |
-| **hint** | Fixed template text keyed by taxonomy. It is emitted only in a shadow packet and is never applied automatically. |
+| **Behavioral Hint** | Fixed source-owned template text keyed by taxonomy. Shadow-packet hints remain diagnostic; the separate default-off Adaptation Layer can apply one template only after config, cohort, relevance, and canonical eligibility gates pass. |
 | **lesson** | A deterministic pseudonymous ID plus taxonomy lifecycle counts/state in the canonical recurrence report. It is never active in this release. |
 | **observed / candidate / activation-eligible** | Lifecycle report states at one root, two roots, or all eligibility gates respectively. “Activation-eligible” is evidence sufficiency, not permission to activate. |
 
@@ -130,7 +150,7 @@ The strict verifier result is the latest qualifying verifier pass/fail by `(crea
 
 All three eligibility conditions are required. Session diversity is calculated only when the `traces` table supplies session linkage. Evaluation aggregates all evidence before applying the output lesson limit, so row ordering/noise cannot starve older roots. The database is opened read-only with `PRAGMA query_only=ON`; a missing database returns an empty report without creating a file. The limit is positive and capped at 200.
 
-Eligibility never changes `active=false`, `activation_allowed=false`, or `prompt_modified=false`.
+Eligibility never changes the recurrence report's `active=false`, `activation_allowed=false`, or `prompt_modified=false`. The separately configured Adaptation Layer treats eligibility as one necessary input, not as activation permission by itself.
 
 ## Privacy threat model and packet contracts
 
@@ -266,22 +286,22 @@ Automatic verifier capture depends on a persisted trace: `append_outcome_event` 
 
 The persistence order is trace first, queued Outcome Events second, recorder marked persisted last. Trace failure prevents event append and leaves candidates retryable. Event append failure does not erase the successfully stored trace or fail the user turn. This prerequisite requires a session database and session persistence; ephemeral `persist_session=False` flows do not durably contribute evidence.
 
-## Limitations and gates before active adaptation
+## Limitations and gates before broader active learning
 
-This release intentionally stops before activation. At minimum, an active-adaptation release still needs:
+This release permits only the bounded, default-off Behavioral Hint path described above. It stops before learned/free-form adaptation, promotion, or durable policy change. Broader active-learning work still needs:
 
 1. **Authenticated evidence producers.** The exact taxonomy-only correction command is now a reviewed runtime producer; broader correction/rejection verifiers and stronger identity binding still require explicit producer designs. Do not expose the permissive fixture API as authentication.
 2. **Prose and injection design.** If user prose is ever interpreted, define provenance, quotation/forwarding handling, prompt-injection resistance, confidence calibration, consent, and appeal/retraction workflows. No such detector exists today.
 3. **Durable delivery.** Replace or supplement the process-local lossy queue with transactional/outbox semantics, bounded durable retention, observability, and recovery tests.
-4. **Activation governance.** Add an independently authorized approval/promotion path, rollback/kill switch, version pinning, audit trail, rejection state, expiry, and conflict resolution. “Activation-eligible” alone must never activate.
-5. **Prompt safety and measurement.** Specify how a lesson could enter prompts, cap influence and token cost, isolate untrusted text, and prove prompt/non-prompt A/B behavior. Current code has no prompt wiring.
+4. **Activation governance.** Add an independently authorized approval/promotion path, audit trail, rejection state, expiry, and conflict resolution for anything beyond this fixed-template, config-gated path. “Activation-eligible” alone never activates; the current path also requires explicit enablement, treatment assignment, and relevance. The current runtime kill switch is not a substitute for full promotion governance.
+5. **Prompt safety and measurement.** Preserve the one-hint/512-character bound and API-only isolation, and establish consented aggregate treatment/control evaluation before expanding influence. Current instrumentation is decision telemetry, not evidence of benefit.
 6. **Privacy review.** Threat-model linkage/timing/count leakage, hash dictionary attacks, retention/deletion, access control, database migration, and real-world canary coverage. Replace contractual metadata discipline with enforceable schemas where needed.
 7. **Verifier breadth and quality.** Define trustworthy non-pytest verification, flaky-test handling, test selection/coverage, retries, contradictory evidence, and background/distributed execution semantics.
 8. **Drift/parity gates.** Add schema compatibility tests across upgrades and representative platforms/providers/tool paths; preserve aggregate-before-limit and effective-event parity.
 9. **Operational evaluation.** Establish precision/recall, false-activation, recurrence reduction, latency/storage budgets, and longitudinal cross-session metrics on consented data.
 10. **Trust-boundary hardening.** Separate fixture/operator APIs from production capabilities and enforce producer authorization at a boundary stronger than an importable Python function/local SQLite file.
 
-Until those gates are implemented and reviewed, treat every match, hint, and eligible lesson as diagnostic output only.
+Until those gates are implemented and reviewed, treat every contrastive match and recurrence lesson as diagnostic. Do not extend the narrow Behavioral Hint path or claim it improves outcomes from eligibility/decision counts alone.
 
 ## Reproduction from a clean tree
 

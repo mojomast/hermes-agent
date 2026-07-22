@@ -120,6 +120,11 @@ from agent.prompt_budget import build_prompt_budget_record, emit_prompt_budget_w
 from agent.tracing import TraceRecorder, active_tracer, hash_user_message
 from agent.shadow_outcome_capture import classify_foreground_pytest
 from agent.outcome_events import append_producer_outcome_event
+from agent.behavioral_adaptation import (
+    AdaptationDecision,
+    decide_behavioral_adaptation,
+    parse_behavioral_adaptation_config,
+)
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 
 _MAX_PENDING_SHADOW_OUTCOMES = 256
@@ -1583,6 +1588,13 @@ class AIAgent:
             _agent_cfg = _load_agent_config()
         except Exception:
             _agent_cfg = {}
+        self._behavioral_adaptation_config = parse_behavioral_adaptation_config(
+            _agent_cfg.get("behavioral_adaptation") if isinstance(_agent_cfg, dict) else None
+        )
+        # parent_session_id identifies delegated and background-review agents;
+        # persist_session=False identifies other ephemeral helper flows.
+        self._behavioral_adaptation_foreground = parent_session_id is None and persist_session
+        self._behavioral_adaptation_decision = AdaptationDecision(None, {})
         # Cache only the derived auxiliary compression context override that is
         # needed later by the startup feasibility check.  Avoid exposing a
         # broad pseudo-public config object on the agent instance.
@@ -3388,6 +3400,44 @@ class AIAgent:
     def _start_shadow_outcome_turn(self, tracer: TraceRecorder) -> None:
         """Install a new turn tracer while retaining retryable prior evidence."""
         self._turn_tracer = tracer
+
+    def _decide_behavioral_adaptation_for_turn(self, task_text: str) -> AdaptationDecision:
+        """Make and record the single privacy-safe adaptation decision for a turn."""
+        from hermes_state import DEFAULT_DB_PATH
+
+        session_db = getattr(self, "_session_db", None)
+        db_path = getattr(session_db, "db_path", None) or DEFAULT_DB_PATH
+        decision = decide_behavioral_adaptation(
+            config=getattr(self, "_behavioral_adaptation_config", None),
+            session_id=getattr(self, "session_id", "") or "",
+            task_text=task_text if isinstance(task_text, str) else "",
+            db_path=db_path,
+            foreground=bool(getattr(self, "_behavioral_adaptation_foreground", False)),
+        )
+        self._behavioral_adaptation_decision = decision
+        tracer = active_tracer(self)
+        if tracer is not None:
+            with tracer.span(
+                "policy_decision", "behavioral_adaptation_decision",
+                metadata=decision.telemetry,
+            ):
+                pass
+        return decision
+
+    def _effective_system_for_api(self, stable_system_prompt: str) -> str:
+        """Assemble API-only system additions without mutating their sources."""
+        parts = [stable_system_prompt or ""]
+        caller_ephemeral = getattr(self, "ephemeral_system_prompt", None)
+        if caller_ephemeral:
+            parts.append(caller_ephemeral)
+        # Runtime kill switch is intentionally checked for every request, not
+        # merely when the once-per-turn policy decision is made.
+        kill_value = os.environ.get("HERMES_DISABLE_BEHAVIORAL_ADAPTATION", "")
+        killed = kill_value.strip().lower() in {"1", "true", "yes", "on"}
+        decision = getattr(self, "_behavioral_adaptation_decision", None)
+        if not killed and isinstance(decision, AdaptationDecision) and decision.suffix:
+            parts.append(decision.suffix)
+        return "\n\n".join(part for part in parts if part).strip()
 
     def _queue_shadow_outcome(
         self,
@@ -9402,9 +9452,7 @@ class AIAgent:
                     self._sanitize_tool_calls_for_strict_api(api_msg)
                 api_messages.append(api_msg)
 
-            effective_system = self._cached_system_prompt or ""
-            if self.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+            effective_system = self._effective_system_for_api(self._cached_system_prompt or "")
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
             if self.prefill_messages:
@@ -9614,6 +9662,11 @@ class AIAgent:
         ))
         self._turn_root_span_cm = self._turn_tracer.span("turn", "root")
         self._turn_root_span_cm.__enter__()
+        # One correction-aware policy decision per foreground turn. The result
+        # is reused by all model iterations and remains outside stored messages.
+        self._decide_behavioral_adaptation_for_turn(
+            user_message if isinstance(user_message, str) else ""
+        )
         # Expose the active task_id so tools running mid-turn (e.g. delegate_task
         # in delegate_tool.py) can identify this agent for the cross-agent file
         # state registry.  Set BEFORE any tool dispatch so snapshots taken at
@@ -10098,9 +10151,7 @@ class AIAgent:
             # Ephemeral additions are API-call-time only (not persisted to session DB).
             # External recall context is injected into the user message, not the system
             # prompt, so the stable cache prefix remains unchanged.
-            effective_system = active_system_prompt or ""
-            if self.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+            effective_system = self._effective_system_for_api(active_system_prompt or "")
             # NOTE: Plugin context from pre_llm_call hooks is injected into the
             # user message (see injection block above), NOT the system prompt.
             # This is intentional — system prompt modifications break the prompt
