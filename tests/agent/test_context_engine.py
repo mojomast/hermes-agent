@@ -163,6 +163,15 @@ class TestStubEngine:
         assert engine.last_prompt_tokens == 1000
         assert engine.last_completion_tokens == 200
 
+    def test_prune_tool_results_only_defaults_to_identity_noop(self):
+        engine = StubEngine()
+        messages = [{"role": "user", "content": "hello"}]
+        result, pruned = engine.prune_tool_results_only(
+            messages, current_tokens=10_000_000
+        )
+        assert result is messages
+        assert pruned == 0
+
 
 # ---------------------------------------------------------------------------
 # ContextCompressor session reset via ABC

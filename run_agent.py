@@ -1775,6 +1775,33 @@ class AIAgent:
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
 
+        def _parse_prune_int(raw, default):
+            """Parse integer pruning config without treating YAML booleans as 0/1."""
+            if isinstance(raw, bool):
+                return default
+            if isinstance(raw, int):
+                return raw
+            if isinstance(raw, float):
+                return int(raw) if raw.is_integer() else default
+            try:
+                return int(str(raw).strip())
+            except (TypeError, ValueError):
+                return default
+
+        compression_proactive_prune_tokens = max(
+            0, _parse_prune_int(_compression_cfg.get("proactive_prune_tokens", 0), 0)
+        )
+        compression_proactive_prune_min_chars = _parse_prune_int(
+            _compression_cfg.get("proactive_prune_min_result_chars", 8000), 8000
+        )
+        compression_proactive_prune_min_reclaim = max(
+            0,
+            _parse_prune_int(
+                _compression_cfg.get("proactive_prune_min_reclaim_tokens", 4096),
+                4096,
+            ),
+        )
+
         # Read optional explicit context_length override for the auxiliary
         # compression model. Custom endpoints often cannot report this via
         # /models, so the startup feasibility check needs the config hint.
@@ -1930,6 +1957,9 @@ class AIAgent:
                 config_context_length=_config_context_length,
                 provider=self.provider,
                 api_mode=self.api_mode,
+                proactive_prune_tokens=compression_proactive_prune_tokens,
+                proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
+                proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             )
         self.compression_enabled = compression_enabled
 
@@ -3312,11 +3342,66 @@ class AIAgent:
         Skipped when ``persist_session=False`` (ephemeral helper flows).
         """
         if not self.persist_session:
-            return
+            return False
         self._apply_persist_user_message_override(messages)
         self._session_messages = messages
         self._save_session_log(messages)
-        self._flush_messages_to_session_db(messages, conversation_history)
+        return self._flush_messages_to_session_db(messages, conversation_history)
+
+    def _proactively_prune_tool_results(
+        self,
+        messages: List[Dict],
+        current_tokens: int,
+        conversation_history: List[Dict] = None,
+    ) -> List[Dict]:
+        """Project old tool results only after the raw turn is durable.
+
+        Proactive projection rewrites messages already sent to the provider, so
+        raw assistant/tool activity must reach both persistence paths before
+        the in-memory list is replaced. The DB flush index prevents later
+        exit-path persistence from duplicating those rows. Disabled and
+        below-trigger configurations remain behavior-neutral.
+        """
+        compressor = getattr(self, "context_compressor", None)
+        try:
+            trigger = int(getattr(compressor, "proactive_prune_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            trigger = 0
+        if trigger <= 0 or current_tokens < trigger:
+            return messages
+
+        prune = getattr(compressor, "prune_tool_results_only", None)
+        if not callable(prune):
+            return messages
+
+        # If persistence unexpectedly raises, retain raw in-memory history
+        # rather than projecting an unrecorded tool result. Persistence helpers
+        # ordinarily handle and log their own storage failures.
+        try:
+            persisted = self._persist_session(messages, conversation_history)
+        except Exception:
+            logger.warning(
+                "raw session persistence failed before proactive projection; skipping",
+                exc_info=True,
+            )
+            return messages
+        if persisted is not True:
+            logger.debug(
+                "raw session ledger unavailable before proactive projection; skipping"
+            )
+            return messages
+
+        try:
+            projected, pruned_count = prune(messages, current_tokens=current_tokens)
+        except Exception:
+            logger.debug("proactive tool-result projection failed; skipping", exc_info=True)
+            return messages
+
+        # Identity + count is the engine's commit contract. Reject malformed
+        # results so message ordering and tool-call/result pairing stay intact.
+        if pruned_count and isinstance(projected, list) and projected is not messages:
+            return projected
+        return messages
 
     def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Persist any un-flushed messages to the SQLite session store.
@@ -3326,7 +3411,7 @@ class AIAgent:
         truly new messages — preventing the duplicate-write bug (#860).
         """
         if not self._session_db:
-            return
+            return False
         self._apply_persist_user_message_override(messages)
         try:
             # If create_session() failed at startup (e.g. transient lock), the
@@ -3364,8 +3449,10 @@ class AIAgent:
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                 )
             self._last_flushed_db_idx = len(messages)
+            return True
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
+            return False
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -12209,6 +12296,12 @@ class AIAgent:
                         # _flush_messages_to_session_db writes compressed messages
                         # to the new session (see preflight compression comment).
                         conversation_history = None
+                    else:
+                        messages = self._proactively_prune_tool_results(
+                            messages,
+                            current_tokens=_real_tokens,
+                            conversation_history=conversation_history,
+                        )
                     
                     # Save session log incrementally (so progress is visible even if interrupted)
                     self._session_messages = messages

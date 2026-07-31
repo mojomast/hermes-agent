@@ -333,6 +333,9 @@ class ContextCompressor(ContextEngine):
         config_context_length: int | None = None,
         provider: str = "",
         api_mode: str = "",
+        proactive_prune_tokens: int = 0,
+        proactive_prune_min_result_chars: int = 8000,
+        proactive_prune_min_reclaim_tokens: int = 4096,
     ):
         self.model = model
         self.base_url = base_url
@@ -342,6 +345,19 @@ class ContextCompressor(ContextEngine):
         self.threshold_percent = threshold_percent
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
+        # Independent, opt-in cost trigger for deterministic tool-result
+        # projection. This path never invokes the summarizer.
+        self.proactive_prune_tokens = int(proactive_prune_tokens or 0)
+        # Keep the floor at least as large as the legacy prune floor so a
+        # generated summary cannot be repeatedly summarized on later turns.
+        self.proactive_prune_min_result_chars = max(
+            200, int(proactive_prune_min_result_chars or 8000)
+        )
+        # Batch cache-breaking rewrites until they reclaim a useful amount.
+        # Unlike the result floor, an explicit zero disables this gate.
+        self.proactive_prune_min_reclaim_tokens = max(
+            0, int(proactive_prune_min_reclaim_tokens)
+        )
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
 
@@ -426,6 +442,8 @@ class ContextCompressor(ContextEngine):
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None,
+        min_prune_chars: int = 200,
+        preserve_protected_tail_exact: bool = False,
     ) -> tuple[List[Dict[str, Any]], int]:
         """Replace old tool result contents with informative 1-line summaries.
 
@@ -507,7 +525,9 @@ class ContextCompressor(ContextEngine):
             if len(content) < 200:
                 continue
             h = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()[:12]
-            if h in content_hashes:
+            if h in content_hashes and not (
+                preserve_protected_tail_exact and i >= prune_boundary
+            ):
                 # This is an older duplicate — replace with back-reference
                 result[i] = {**msg, "content": "[Duplicate tool output — same content as a more recent call]"}
                 pruned += 1
@@ -528,8 +548,10 @@ class ContextCompressor(ContextEngine):
             # Skip already-deduplicated or previously-summarized results
             if content.startswith("[Duplicate tool output"):
                 continue
-            # Only prune if the content is substantial (>200 chars)
-            if len(content) > 200:
+            # Only prune if the content exceeds the selected floor. Full
+            # compression keeps the legacy 200-char default; proactive
+            # projection raises it substantially.
+            if len(content) > min_prune_chars:
                 call_id = msg.get("tool_call_id", "")
                 tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
                 summary = _summarize_tool_result(tool_name, tool_args, content)
@@ -563,6 +585,40 @@ class ContextCompressor(ContextEngine):
                 result[i] = {**msg, "tool_calls": new_tcs}
 
         return result, pruned
+
+    def prune_tool_results_only(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int | None = None,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Project old tool payloads on a low trigger, without an LLM call.
+
+        The recent ``protect_last_n`` messages are retained exactly. The
+        projection commits only when its measured rough-token reclaim reaches
+        the hysteresis threshold; every no-op returns the original list object.
+        """
+        if self.proactive_prune_tokens <= 0:
+            return messages, 0
+        if current_tokens is not None and current_tokens < self.proactive_prune_tokens:
+            return messages, 0
+        if len(messages) <= self.protect_last_n:
+            return messages, 0
+
+        projected, pruned = self._prune_old_tool_results(
+            messages,
+            protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=None,
+            min_prune_chars=self.proactive_prune_min_result_chars,
+            preserve_protected_tail_exact=True,
+        )
+        if not pruned:
+            return messages, 0
+
+        before = estimate_messages_tokens_rough(messages)
+        after = estimate_messages_tokens_rough(projected)
+        if before - after < self.proactive_prune_min_reclaim_tokens:
+            return messages, 0
+        return projected, pruned
 
     # ------------------------------------------------------------------
     # Summarization

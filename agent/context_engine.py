@@ -105,6 +105,21 @@ class ContextEngine(ABC):
         """
         return False
 
+    # -- Optional: proactive tool-result projection -----------------------
+
+    def prune_tool_results_only(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int | None = None,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Deterministically project old tool results without an LLM call.
+
+        Context-engine plugins are not required to support this optimization.
+        The identity-preserving default lets callers safely invoke the hook on
+        every engine and use object identity to distinguish a committed prune.
+        """
+        return messages, 0
+
     # -- Optional: manual /compress preflight ------------------------------
 
     def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:

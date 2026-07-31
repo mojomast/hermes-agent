@@ -494,6 +494,9 @@ compression:
   threshold: 0.50                                   # Compress at this % of context limit
   target_ratio: 0.20                                # Fraction of threshold to preserve as recent tail
   protect_last_n: 20                                # Min recent messages to keep uncompressed
+  proactive_prune_tokens: 0                         # Opt-in no-LLM tool-result projection trigger (0 = off)
+  proactive_prune_min_result_chars: 8000            # Only summarize older tool results larger than this
+  proactive_prune_min_reclaim_tokens: 4096          # Commit only when at least this many tokens are reclaimed
 
 # The summarization model/provider is configured under auxiliary:
 auxiliary:
@@ -506,6 +509,8 @@ auxiliary:
 :::info Legacy config migration
 Older configs with `compression.summary_model`, `compression.summary_provider`, and `compression.summary_base_url` are automatically migrated to `auxiliary.compression.*` on first load (config version 17). No manual action needed.
 :::
+
+`proactive_prune_tokens` enables deterministic, no-LLM projection of old tool-result payloads independently of full context compression. This is useful on large-window models where the normal compression threshold is rarely reached and bulky terminal, file, or web outputs would otherwise be re-sent on every turn. The default is `0` (disabled); `48000` is a reasonable starting point when opting in. The built-in compressor protects the recent `protect_last_n` messages, only summarizes results above `proactive_prune_min_result_chars` (clamped to at least 200 characters), and commits only if it reclaims `proactive_prune_min_reclaim_tokens` (set `0` to accept any non-zero reclaim). The reclaim gate amortizes provider prompt-cache invalidation instead of rewriting the cache prefix every turn. Raw assistant and tool activity is persisted before the in-memory projection, so complete output remains recoverable from session storage. Other context engines safely treat this hook as a no-op.
 
 ### Common setups
 

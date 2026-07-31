@@ -545,7 +545,12 @@ DEFAULT_CONFIG = {
         "threshold": 0.50,            # compress when context usage exceeds this ratio
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
-
+        # Opt-in deterministic pruning of old tool-result payloads. This is
+        # independent of full LLM-backed compression and helps large context
+        # windows where the normal threshold is rarely reached.
+        "proactive_prune_tokens": 0,   # 0 disables proactive projection
+        "proactive_prune_min_result_chars": 8000,
+        "proactive_prune_min_reclaim_tokens": 4096,
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
