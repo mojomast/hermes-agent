@@ -4374,14 +4374,74 @@ class APIServerAdapter(BasePlatformAdapter):
                     "status": "completed",
                 }))
 
+            def _on_subagent_progress(event_type, tool_name=None, preview=None, args=None, **kwargs):
+                """Relay subagent lifecycle events as ``hermes`` frames.
+
+                ``tool_progress_callback`` is not wired wholesale here — it
+                would duplicate every ``tool.*`` emit because ``run_agent``
+                fires it side-by-side with ``tool_start_callback`` /
+                ``tool_complete_callback``.  But ``subagent.spawn_requested``
+                / ``subagent.start`` / ``subagent.complete`` have no
+                structured counterpart: they only travel on this callback
+                (relayed by delegate_tool with the child's session id), so
+                forwarding just those keeps dashboards able to surface
+                in-flight subagents without any tool event duplication.
+                """
+                if event_type not in {"subagent.spawn_requested", "subagent.start", "subagent.complete"}:
+                    return
+                child_session_id = str(kwargs.get("child_session_id") or "").strip()
+                subagent_id = str(kwargs.get("subagent_id") or "").strip()
+                delegate_call_id = str(kwargs.get("delegate_call_id") or "").strip()
+                if not child_session_id and not subagent_id:
+                    return
+                if event_type in {"subagent.spawn_requested", "subagent.start"}:
+                    goal = kwargs.get("goal") or preview or ""
+                    _stream_q.put_threadsafe(("__tool_progress__", {
+                        "hermes": {
+                            "type": "child_session_started",
+                            "child_session_id": child_session_id,
+                            "subagent_id": subagent_id,
+                            "delegate_call_id": delegate_call_id,
+                            "task_index": kwargs.get("task_index"),
+                            "task_count": kwargs.get("task_count"),
+                            "goal": redact_sensitive_text(str(goal), force=True),
+                            "label": redact_sensitive_text(
+                                str(kwargs.get("label") or goal or "delegate_task"),
+                                force=True,
+                            ),
+                            "parent_session_id": str(
+                                kwargs.get("parent_id")
+                                or kwargs.get("parent_session_id")
+                                or session_id
+                                or ""
+                            ),
+                        }
+                    }))
+                else:
+                    _stream_q.put_threadsafe(("__tool_progress__", {
+                        "hermes": {
+                            "type": "run_state",
+                            "status": kwargs.get("status") or "complete",
+                            "child_session_id": child_session_id,
+                            "subagent_id": subagent_id,
+                            "summary": redact_sensitive_text(
+                                str(kwargs.get("summary") or preview or ""),
+                                force=True,
+                            ),
+                            "duration_seconds": kwargs.get("duration_seconds"),
+                        }
+                    }))
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             #
-            # ``tool_progress_callback`` is intentionally not wired here:
+            # ``tool_progress_callback`` is intentionally not wired wholesale:
             # it would duplicate every emit because ``run_agent`` fires it
             # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
             # The structured callbacks are strictly richer (they carry
             # the tool_call id), so they own the chat-completions SSE channel.
+            # ``_on_subagent_progress`` filters that callback down to the two
+            # subagent lifecycle events that have no structured equivalent.
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -4391,6 +4451,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream_delta_callback=_on_delta,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                tool_progress_callback=_on_subagent_progress,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,

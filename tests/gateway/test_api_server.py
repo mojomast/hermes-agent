@@ -1292,6 +1292,132 @@ class TestChatCompletionsEndpoint:
             assert '"status": "completed"' not in body
 
 
+    @pytest.mark.asyncio
+    async def test_stream_relays_subagent_lifecycle_as_hermes_frames(self, adapter):
+        """Subagent lifecycle events must reach chat-completions SSE consumers.
+
+        ``delegate_tool`` relays ``subagent.start``/``subagent.complete``
+        exclusively through the parent agent's ``tool_progress_callback``,
+        carrying the child's session id.  The chat-completions handler must
+        forward just those two event types as ``hermes`` frames so
+        dashboards can surface in-flight subagents — without duplicating the
+        ``tool.*`` lifecycle the structured callbacks already emit.
+        """
+        import asyncio
+        import json as _json
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                tp_cb = kwargs.get("tool_progress_callback")
+                # Simulate delegate_tool's relay of the two lifecycle events
+                # plus the tool events the structured callbacks own.
+                if tp_cb:
+                    tp_cb(
+                        "subagent.spawn_requested",
+                        preview="Write the report",
+                        task_index=0,
+                        task_count=2,
+                        goal="Write the report",
+                        subagent_id="subagent-report",
+                        child_session_id="child-report-session",
+                        delegate_call_id="  call-delegate-report  ",
+                        parent_id="parent-session",
+                    )
+                if tp_cb:
+                    tp_cb(
+                        "subagent.start",
+                        preview="Write the report",
+                        task_index=0,
+                        task_count=2,
+                        goal="Write the report",
+                        subagent_id="subagent-report",
+                        child_session_id="child-report-session",
+                        delegate_call_id="  call-delegate-report  ",
+                        parent_id="parent-session",
+                    )
+                if tp_cb:
+                    tp_cb(
+                        "subagent.complete",
+                        preview="Done",
+                        subagent_id="subagent-report",
+                        child_session_id="child-report-session",
+                        status="complete",
+                        summary="Wrote the report",
+                        duration_seconds=12.5,
+                    )
+                if tp_cb:
+                    # tool.* events must NOT be forwarded by the filtered
+                    # callback (the structured callbacks own those).
+                    tp_cb("tool.started", "terminal", {"command": "ls"})
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "delegate"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+            # Collect hermes-wrapped frames from the SSE body.
+            hermes_frames = []
+            lines = body.splitlines()
+            for i, line in enumerate(lines):
+                if line.strip() != "event: hermes.tool.progress":
+                    continue
+                for follow in lines[i + 1: i + 4]:
+                    if follow.startswith("data: "):
+                        try:
+                            payload = _json.loads(follow[len("data: "):])
+                        except _json.JSONDecodeError:
+                            break
+                        inner = payload.get("hermes")
+                        if isinstance(inner, dict):
+                            hermes_frames.append(inner)
+                        break
+
+            assert len(hermes_frames) == 3, hermes_frames
+            spawned = hermes_frames[0]
+            started = hermes_frames[1]
+            completed = hermes_frames[2]
+            assert spawned["type"] == "child_session_started"
+            assert spawned["child_session_id"] == "child-report-session"
+            assert spawned["subagent_id"] == "subagent-report"
+            assert spawned["task_index"] == 0
+            assert spawned["task_count"] == 2
+            assert spawned["delegate_call_id"] == "call-delegate-report"
+            assert spawned["parent_session_id"] == "parent-session"
+            assert started["type"] == "child_session_started"
+            assert started["child_session_id"] == "child-report-session"
+            assert started["subagent_id"] == "subagent-report"
+            assert started["task_index"] == 0
+            assert started["task_count"] == 2
+            assert started["delegate_call_id"] == "call-delegate-report"
+            assert started["parent_session_id"] == "parent-session"
+            assert completed["type"] == "run_state"
+            assert completed["status"] == "complete"
+            assert completed["child_session_id"] == "child-report-session"
+            assert completed["subagent_id"] == "subagent-report"
+            assert completed["duration_seconds"] == 12.5
+
+            # The filtered callback must not duplicate tool.* lifecycle —
+            # the structured tool_start/tool_complete callbacks own those,
+            # so only the two hermes frames should appear.
+            assert '"tool": "terminal"' not in body
+
+
 # ---------------------------------------------------------------------------
 # _derive_chat_session_id unit tests
 # ---------------------------------------------------------------------------
