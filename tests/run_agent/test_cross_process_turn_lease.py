@@ -174,7 +174,7 @@ def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):
     ]
 
 
-def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
+def test_fresh_session_takes_lease_and_keeps_caller_seed(monkeypatch):
     db = _DB(session_exists=False)
     agent = _agent_with_db(db, session_id="fresh", platform="subagent")
     agent._session_db_created = False
@@ -193,7 +193,103 @@ def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
     AIAgent.run_conversation(agent, "work", conversation_history=seed)
 
     assert observed["history"] is seed
-    assert db.events == []
+    assert [event[0] for event in db.events] == ["acquire", "release"]
+
+
+def test_fresh_session_waiter_reloads_row_created_by_first_turn(monkeypatch):
+    db = _DB(session_exists=False)
+    agent = _agent_with_db(db, session_id="fresh")
+
+    def acquire_after_wait(session_id, holder, **kwargs):
+        db.events.append(("acquire", session_id, holder))
+        kwargs["on_wait"](0.0)
+        db.session_exists = True
+        return True
+
+    db.acquire_session_turn_lease = acquire_after_wait
+    observed = {}
+
+    def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
+        observed["history"] = history
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+    AIAgent.run_conversation(
+        agent,
+        "second message",
+        conversation_history=[{"role": "user", "content": "stale seed"}],
+    )
+
+    assert observed["history"] == [{"role": "user", "content": "durable latest"}]
+    assert [event[0] for event in db.events] == [
+        "acquire",
+        "resolve",
+        "reload",
+        "release",
+    ]
+
+
+def test_concurrent_fresh_turn_waits_then_reloads_persisted_first_turn(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "state.db"
+    first_db = SessionDB(path)
+    second_db = SessionDB(path)
+    first = _agent_with_db(first_db, session_id="fresh")
+    second = _agent_with_db(second_db, session_id="fresh")
+    first._turn_marker = "first"
+    second._turn_marker = "second"
+    first_entered = threading.Event()
+    second_waiting = threading.Event()
+    observed = {}
+    errors = []
+
+    def second_status(_kind, text=None):
+        if text and "waiting for it to finish" in text:
+            second_waiting.set()
+
+    second.status_callback = second_status
+
+    def fake_run(agent, _message, _system, history, *_args, **_kwargs):
+        if agent._turn_marker == "first":
+            first_entered.set()
+            assert second_waiting.wait(2)
+            first_db.create_session("fresh", source="test")
+            first_db.append_message("fresh", "user", "first request")
+            first_db.append_message("fresh", "assistant", "first response")
+            return {"final_response": "first response", "messages": [], "failed": False}
+        observed["history"] = history
+        return {"final_response": "second response", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+
+    def run(agent, message):
+        try:
+            AIAgent.run_conversation(
+                agent,
+                message,
+                conversation_history=[{"role": "user", "content": f"{message} seed"}],
+            )
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=run, args=(first, "first"))
+    second_thread = threading.Thread(target=run, args=(second, "second"))
+    first_thread.start()
+    assert first_entered.wait(2)
+    second_thread.start()
+    first_thread.join(5)
+    second_thread.join(5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == []
+    assert [(message["role"], message["content"]) for message in observed["history"]] == [
+        ("user", "first request"),
+        ("assistant", "first response"),
+    ]
+    first_db.close()
+    second_db.close()
 
 
 def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):

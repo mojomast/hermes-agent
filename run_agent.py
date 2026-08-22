@@ -8490,11 +8490,6 @@ class AIAgent:
                 _turn_db is not None
                 and session_id
                 and not getattr(self, "_persist_disabled", False)
-                # A fresh session id is process-unique and has no durable
-                # transcript to race over. More importantly, subagent/new-turn
-                # callers may intentionally supply an in-memory seed before the
-                # row exists; reloading an absent row would erase that seed.
-                and _durable_session_exists
                 # Test doubles and third-party DB shims may accept arbitrary
                 # MagicMock attributes without implementing the protocol. Check
                 # the concrete type so only real implementations opt in.
@@ -8502,10 +8497,6 @@ class AIAgent:
                     getattr(type(_turn_db), "acquire_session_turn_lease", None)
                 )
             ):
-                # Resumed agents also defer their create check until the turn
-                # prologue. We just proved this row exists, so suppress the
-                # redundant create attempt after acquiring it.
-                self._session_db_created = True
                 _durable_holder = (
                     f"pid={os.getpid()}:turn={relay_turn_id}:platform="
                     f"{task_context['platform'] or 'unknown'}"
@@ -8604,7 +8595,28 @@ class AIAgent:
                 durable_turn_lease = _durable_holder
                 self._active_session_turn_lease_holder = _durable_holder
                 self._active_session_turn_lease_ttl_seconds = _lease_ttl
-                if _lease_waited:
+                # A second first-turn caller can observe the row as absent,
+                # wait on the lease, then acquire it after the first caller has
+                # persisted. Re-probe after waiting so it reloads that completed
+                # turn instead of running with its stale caller seed. The first
+                # owner acquires immediately and deliberately keeps its seed.
+                _reload_durable_history = _durable_session_exists
+                if _lease_waited and not _reload_durable_history:
+                    try:
+                        _reload_durable_history = (
+                            _turn_db.get_session(session_id) is not None
+                        )
+                    except Exception:
+                        # The wait proves another turn owned this session. If
+                        # the post-wait probe is temporarily locked, fail closed
+                        # into the reload path rather than replay stale history.
+                        _reload_durable_history = True
+                if _reload_durable_history:
+                    # Existing rows are already initialized. Fresh owners leave
+                    # this false so normal first-turn setup can enrich the row
+                    # with model/system metadata before persistence.
+                    self._session_db_created = True
+                if _lease_waited and _reload_durable_history:
                     self._emit_status(
                         "Session is free; loading the latest transcript..."
                     )
@@ -8615,7 +8627,7 @@ class AIAgent:
                 # Skip when acquisition was immediate — no other process held
                 # the lease, so the in-memory history is current and reloading
                 # would only cause an unnecessary prompt cache miss.
-                if _lease_waited:
+                if _lease_waited and _reload_durable_history:
                     latest_session_id = _turn_db.resolve_resume_session_id(session_id)
                     if latest_session_id:
                         self.session_id = latest_session_id
