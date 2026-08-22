@@ -48,6 +48,7 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
+    app.router.add_post("/api/sessions/{session_id}/compress", adapter._handle_session_compress)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     return app
@@ -66,6 +67,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_chat"] is True
     assert features["session_chat_streaming"] is True
     assert features["session_fork"] is True
+    assert features["session_compress"] is True
     assert features["run_steer"] is True
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
@@ -75,6 +77,10 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert data["endpoints"]["session_chat_stream"] == {
         "method": "POST",
         "path": "/api/sessions/{session_id}/chat/stream",
+    }
+    assert data["endpoints"]["session_compress"] == {
+        "method": "POST",
+        "path": "/api/sessions/{session_id}/compress",
     }
     assert data["endpoints"]["run_steer"] == {
         "method": "POST",
@@ -364,6 +370,158 @@ async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter
     assert all(m.get("role") in ("assistant", "tool") for m in messages)
     # The tool call is preserved alongside the intermediate text.
     assert any(m.get("tool_calls") for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_session_compress_rejects_a_busy_conversation(adapter, session_db):
+    session_id = session_db.create_session("compress-busy", "api_server")
+    assert session_db.try_acquire_session_turn_lease(
+        session_id,
+        "busy-test-holder",
+    )
+
+    try:
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/compress",
+                json={},
+            )
+            payload = await resp.json()
+    finally:
+        session_db.release_session_turn_lease(session_id, "busy-test-holder")
+
+    assert resp.status == 409
+    assert payload["error"]["code"] == "session_busy"
+
+
+@pytest.mark.asyncio
+async def test_session_compress_returns_and_persists_rotated_tip(
+    adapter,
+    session_db,
+    monkeypatch,
+):
+    session_id = session_db.create_session(
+        "compress-source",
+        "api_server",
+        model="test-model",
+        system_prompt="stored system prompt",
+    )
+    history = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "second question"},
+        {"role": "assistant", "content": "second answer"},
+    ]
+    session_db.replace_messages(session_id, history)
+    compacted = [
+        {"role": "user", "content": "compressed summary"},
+        {"role": "assistant", "content": "latest answer"},
+    ]
+    closed = {}
+    create_agent_kwargs = {}
+
+    class FakeCompressor:
+        def has_content_to_compress(self, messages):
+            return True
+
+    class FakeAgent:
+        session_prompt_tokens = 11
+        session_completion_tokens = 3
+        session_total_tokens = 14
+        tools = None
+
+        def __init__(self):
+            self.session_id = session_id
+            self.context_compressor = FakeCompressor()
+            self._cached_system_prompt = None
+            self._session_init_model_config = {"max_iterations": 4}
+            self._last_compaction_in_place = False
+            self._compression_skipped_due_to_lock = None
+            self._end_session_on_close = True
+
+        def _compress_context(
+            self,
+            messages,
+            system_message,
+            *,
+            approx_tokens,
+            focus_topic,
+            force,
+        ):
+            assert [
+                (message["role"], message["content"])
+                for message in messages
+            ] == [
+                (message["role"], message["content"])
+                for message in history
+            ]
+            assert system_message is None
+            assert approx_tokens > 0
+            assert focus_topic == "deployment decisions"
+            assert force is True
+            session_db.end_session(session_id, "compression")
+            session_db.create_session(
+                "compress-tip",
+                "api_server",
+                model="test-model",
+                parent_session_id=session_id,
+            )
+            session_db.replace_messages("compress-tip", compacted)
+            self.session_id = "compress-tip"
+            return compacted, None
+
+        def close(self):
+            closed["end_session"] = self._end_session_on_close
+
+    def create_agent(**kwargs):
+        create_agent_kwargs.update(kwargs)
+        return FakeAgent()
+
+    monkeypatch.setattr(adapter, "_create_agent", create_agent)
+    monkeypatch.setattr(
+        "agent.manual_compression_feedback.summarize_manual_compression",
+        lambda *args, **kwargs: {
+            "aborted": False,
+            "fallback_used": False,
+            "headline": "Compressed: 4 -> 2 messages",
+            "token_line": "Approx request size reduced",
+            "note": None,
+        },
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/compress",
+            json={"focus_topic": "deployment decisions"},
+        )
+        payload = await resp.json()
+
+    assert resp.status == 200, payload
+    assert resp.headers["X-Hermes-Session-Id"] == "compress-tip"
+    assert payload["status"] == "compressed"
+    assert payload["compressed"] is True
+    assert payload["requested_session_id"] == session_id
+    assert payload["old_session_id"] == session_id
+    assert payload["session_id"] == "compress-tip"
+    assert payload["rotated"] is True
+    assert payload["in_place"] is False
+    assert payload["before_messages"] == 4
+    assert payload["after_messages"] == 2
+    assert payload["removed"] == 2
+    assert payload["usage"] == {
+        "input_tokens": 11,
+        "output_tokens": 3,
+        "total_tokens": 14,
+    }
+    assert create_agent_kwargs["skip_memory"] is True
+    assert closed == {"end_session": False}
+    assert session_db.get_session(session_id)["end_reason"] == "compression"
+    assert [
+        message["content"]
+        for message in session_db.get_messages_as_conversation("compress-tip")
+    ] == ["compressed summary", "latest answer"]
 
 
 # ---------------------------------------------------------------------------

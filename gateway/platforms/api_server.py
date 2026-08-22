@@ -13,6 +13,7 @@ Exposes an HTTP server with endpoints:
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
+- POST /api/sessions/{session_id}/compress — compact persisted session history
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
@@ -2072,6 +2073,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
+            ("POST", "/api/sessions/{session_id}/compress", self._handle_session_compress),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
@@ -2653,6 +2655,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        skip_memory: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2963,6 +2966,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
+            "skip_memory": skip_memory,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
@@ -3184,6 +3188,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "session_compress": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -3217,6 +3222,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
+                "session_compress": {"method": "POST", "path": "/api/sessions/{session_id}/compress"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
@@ -3720,6 +3726,348 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
         fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+
+    @_admit_api_agent_request
+    async def _handle_session_compress(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/compress — compact persisted history."""
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return key_err
+
+        requested_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(requested_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        focus_topic_raw = body.get("focus_topic")
+        if focus_topic_raw is not None and not isinstance(focus_topic_raw, str):
+            return web.json_response(
+                _openai_error(
+                    "focus_topic must be a string",
+                    code="invalid_focus_topic",
+                ),
+                status=400,
+            )
+        focus_topic = (focus_topic_raw or "").strip() or None
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable",
+                    code="session_db_unavailable",
+                ),
+                status=503,
+            )
+        source_id = await asyncio.to_thread(db.resolve_resume_session_id, requested_id)
+        session = await asyncio.to_thread(db.get_session, source_id)
+        if not session:
+            return web.json_response(
+                _openai_error(
+                    f"Session not found: {source_id}",
+                    code="session_not_found",
+                ),
+                status=404,
+            )
+
+        active_states = {"queued", "running", "waiting_for_approval", "stopping"}
+        if any(
+            status.get("session_id") in {requested_id, source_id}
+            and status.get("status") in active_states
+            for status in self._run_statuses.values()
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Session has queued or active agent work.",
+                    code="session_busy",
+                ),
+                status=409,
+            )
+
+        runtime_request = self._effective_session_runtime_request(
+            session=session,
+            body={},
+        )
+        lock_active = bool(runtime_request.get("require_model_lock"))
+        if lock_active:
+            route = runtime_request.get("route")
+            session_model = None
+            requested_runtime = runtime_request.get("requested") or {}
+            agent_overrides: Dict[str, Any] = {}
+            if requested_runtime.get("model"):
+                agent_overrides["requested_model"] = requested_runtime["model"]
+            if requested_runtime.get("provider"):
+                agent_overrides["requested_provider"] = requested_runtime["provider"]
+            if runtime_request.get("model_options"):
+                agent_overrides["model_options"] = runtime_request["model_options"]
+        else:
+            stored_model = self._stored_session_model(session)
+            stored_route = self._resolve_route(stored_model)
+            route = stored_route
+            session_model = stored_model if (stored_model and stored_route is None) else None
+            agent_overrides = {}
+
+        request_profile = _api_request_profile.get()
+        agent_ref: list[Any] = [None]
+
+        def _compress() -> Dict[str, Any]:
+            from agent.manual_compression_feedback import (
+                describe_compression_lock_skip,
+                summarize_manual_compression,
+            )
+            from agent.model_metadata import estimate_request_tokens_rough
+            from gateway.run import (
+                _GATEWAY_HYGIENE_PLATFORM,
+                _seed_hygiene_system_prompt,
+            )
+            from gateway.session_context import clear_session_vars
+
+            holder = (
+                f"pid={os.getpid()}:api-compress={uuid.uuid4().hex}:"
+                f"platform=api_server"
+            )
+            if not db.acquire_session_turn_lease(
+                source_id,
+                holder,
+                ttl_seconds=900.0,
+                wait_seconds=0.0,
+            ):
+                return {
+                    "_error": "Session has queued or active agent work.",
+                    "_error_code": "session_busy",
+                    "_http_status": 409,
+                }
+
+            tokens = []
+            agent = None
+            try:
+                tokens = self._bind_api_server_session(
+                    chat_id=source_id,
+                    session_key=gateway_session_key or source_id,
+                    session_id=source_id,
+                )
+                history = db.get_messages_as_conversation(source_id)
+                before_count = len(history)
+                if before_count < 4:
+                    return {
+                        "status": "skipped",
+                        "reason": "not_enough_messages",
+                        "compressed": False,
+                        "requested_session_id": requested_id,
+                        "old_session_id": source_id,
+                        "session_id": source_id,
+                        "rotated": False,
+                        "in_place": False,
+                        "before_messages": before_count,
+                        "after_messages": before_count,
+                        "removed": 0,
+                    }
+
+                agent = self._create_agent(
+                    session_id=source_id,
+                    gateway_session_key=gateway_session_key,
+                    route=route,
+                    session_model=session_model,
+                    confirmed_runtime_lock=lock_active,
+                    skip_memory=True,
+                    **agent_overrides,
+                )
+                agent_ref[0] = agent
+                self._shutdown_interruptible_agents[id(agent)] = agent
+                agent._end_session_on_close = False
+                agent._print_fn = lambda *args, **kwargs: None
+                _seed_hygiene_system_prompt(agent, session)
+                agent.platform = _GATEWAY_HYGIENE_PLATFORM
+
+                persisted_config = self._parse_session_model_config(
+                    session.get("model_config")
+                )
+                init_config = dict(
+                    getattr(agent, "_session_init_model_config", {}) or {}
+                )
+                agent._session_init_model_config = {
+                    **init_config,
+                    **persisted_config,
+                }
+
+                system_prompt = getattr(agent, "_cached_system_prompt", "") or ""
+                tools = getattr(agent, "tools", None) or None
+                before_tokens = estimate_request_tokens_rough(
+                    history,
+                    system_prompt=system_prompt,
+                    tools=tools,
+                )
+                compressor = agent.context_compressor
+                if not compressor.has_content_to_compress(history):
+                    return {
+                        "status": "skipped",
+                        "reason": "nothing_to_compress",
+                        "compressed": False,
+                        "requested_session_id": requested_id,
+                        "old_session_id": source_id,
+                        "session_id": source_id,
+                        "rotated": False,
+                        "in_place": False,
+                        "before_messages": before_count,
+                        "after_messages": before_count,
+                        "before_tokens": before_tokens,
+                        "after_tokens": before_tokens,
+                        "removed": 0,
+                    }
+
+                agent._compress_context(
+                    history,
+                    None,
+                    approx_tokens=before_tokens,
+                    focus_topic=focus_topic,
+                    force=True,
+                )
+                lock_signal = getattr(
+                    agent,
+                    "_compression_skipped_due_to_lock",
+                    None,
+                )
+                if lock_signal is True or isinstance(lock_signal, str):
+                    return {
+                        "_error": describe_compression_lock_skip(lock_signal),
+                        "_error_code": "compression_in_progress",
+                        "_http_status": 409,
+                    }
+
+                new_session_id = getattr(agent, "session_id", None) or source_id
+                in_place = bool(
+                    getattr(agent, "_last_compaction_in_place", False)
+                )
+                after_history = db.get_messages_as_conversation(new_session_id)
+                after_tokens = estimate_request_tokens_rough(
+                    after_history,
+                    system_prompt=(
+                        getattr(agent, "_cached_system_prompt", "")
+                        or system_prompt
+                    ),
+                    tools=getattr(agent, "tools", None) or tools,
+                )
+                summary = summarize_manual_compression(
+                    history,
+                    after_history,
+                    before_tokens,
+                    after_tokens,
+                    compression_state=compressor,
+                )
+                changed = new_session_id != source_id or in_place
+                return {
+                    "status": (
+                        "aborted"
+                        if summary["aborted"]
+                        else "compressed"
+                        if changed
+                        else "skipped"
+                    ),
+                    "reason": None if changed else "no_progress",
+                    "compressed": changed and not summary["aborted"],
+                    "requested_session_id": requested_id,
+                    "old_session_id": source_id,
+                    "session_id": new_session_id,
+                    "rotated": new_session_id != source_id,
+                    "in_place": in_place,
+                    "before_messages": before_count,
+                    "after_messages": len(after_history),
+                    "before_tokens": before_tokens,
+                    "after_tokens": after_tokens,
+                    "removed": before_count - len(after_history),
+                    "summary": summary,
+                    "usage": {
+                        "input_tokens": getattr(
+                            agent, "session_prompt_tokens", 0
+                        )
+                        or 0,
+                        "output_tokens": getattr(
+                            agent, "session_completion_tokens", 0
+                        )
+                        or 0,
+                        "total_tokens": getattr(
+                            agent, "session_total_tokens", 0
+                        )
+                        or 0,
+                    },
+                }
+            finally:
+                if agent is not None:
+                    self._shutdown_interruptible_agents.pop(id(agent), None)
+                    try:
+                        agent.close()
+                    except Exception:
+                        logger.debug(
+                            "Temporary API compression agent cleanup failed",
+                            exc_info=True,
+                        )
+                if tokens:
+                    clear_session_vars(tokens)
+                try:
+                    db.release_session_turn_lease(source_id, holder)
+                except Exception:
+                    logger.error(
+                        "Failed to release API compression turn lease: %s",
+                        source_id,
+                        exc_info=True,
+                    )
+
+        def _compress_in_profile() -> Dict[str, Any]:
+            with self._profile_scope(request_profile):
+                return _compress()
+
+        self._activate_admitted_request()
+        self._inflight_agent_runs += 1
+        worker = asyncio.create_task(asyncio.to_thread(_compress_in_profile))
+        try:
+            payload = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            agent = agent_ref[0]
+            if agent is not None:
+                request_hard_interrupt(agent, "Session compression request cancelled")
+            with suppress(Exception):
+                await asyncio.shield(worker)
+            raise
+        except _ProviderAuthResolutionError as exc:
+            return web.json_response(
+                _openai_error(
+                    f"Session compression provider unavailable: {exc}",
+                    err_type="server_error",
+                    code="compression_provider_unavailable",
+                ),
+                status=503,
+            )
+        except Exception as exc:
+            logger.exception(
+                "POST /api/sessions/%s/compress failed",
+                requested_id,
+            )
+            return web.json_response(
+                _openai_error(
+                    f"Session compression failed: {_redact_api_error_text(exc)}",
+                    err_type="server_error",
+                    code="session_compression_failed",
+                ),
+                status=500,
+            )
+        finally:
+            self._inflight_agent_runs = max(0, self._inflight_agent_runs - 1)
+
+        if payload.get("_error"):
+            return web.json_response(
+                _openai_error(
+                    payload["_error"],
+                    code=payload.get("_error_code"),
+                ),
+                status=int(payload.get("_http_status") or 500),
+            )
+        payload = {"object": "hermes.session.compression", **payload}
+        headers = {"X-Hermes-Session-Id": payload["session_id"]}
+        if gateway_session_key:
+            headers["X-Hermes-Session-Key"] = gateway_session_key
+        return web.json_response(payload, headers=headers)
 
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
