@@ -20192,16 +20192,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             
             # Check for pending process watchers (check_interval on background processes)
             try:
-                from tools.process_registry import process_registry
-                # Detach the current batch atomically (see crash-recovery drain
-                # above): reassign to a fresh list so a watcher appended by a
-                # concurrent session during the yield isn't dropped by clear().
-                watchers = process_registry.pending_watchers
-                process_registry.pending_watchers = []
-                for i, watcher in enumerate(watchers):
-                    asyncio.create_task(self._run_process_watcher(watcher))
-                    if i % 100 == 99:
-                        await asyncio.sleep(0)
+                await self._drain_pending_process_watchers()
             except Exception as e:
                 logger.error("Process watcher setup error: %s", e)
 
@@ -25554,6 +25545,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)
+
+    async def _drain_pending_process_watchers(self) -> int:
+        """Start process watchers registered during the completed agent turn."""
+        from tools.process_registry import process_registry
+
+        # Reassign rather than clear: a worker thread may append to the new list
+        # while this detached batch yields between groups.
+        watchers = process_registry.pending_watchers
+        process_registry.pending_watchers = []
+        if not hasattr(self, "_background_tasks"):
+            self._background_tasks = set()
+        for i, watcher in enumerate(watchers):
+            task = asyncio.create_task(self._run_process_watcher(watcher))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            if i % 100 == 99:
+                await asyncio.sleep(0)
+        if watchers:
+            logger.info("Scheduled %d pending process watcher(s)", len(watchers))
+        return len(watchers)
 
     async def _run_process_watcher(self, watcher: dict) -> None:
         """

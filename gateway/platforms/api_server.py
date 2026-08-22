@@ -6960,7 +6960,17 @@ class APIServerAdapter(BasePlatformAdapter):
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
         try:
-            return await loop.run_in_executor(None, _run)
+            result = await loop.run_in_executor(None, _run)
+            # API-server requests own their agent lifecycle and never pass
+            # through GatewayRunner's normal post-turn watcher drain. Hand off
+            # terminal notify_on_complete watchers before returning the request.
+            runner = self.gateway_runner
+            if runner is not None:
+                try:
+                    await runner._drain_pending_process_watchers()
+                except Exception as exc:
+                    logger.error("API process watcher setup error: %s", exc)
+            return result
         finally:
             self._inflight_agent_runs -= 1
 

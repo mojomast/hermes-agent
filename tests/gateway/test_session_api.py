@@ -10,6 +10,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
+from gateway.run import GatewayRunner
 from hermes_state import SessionDB
 
 
@@ -171,6 +172,65 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         "context_session_key": "request-key",
         "child_session_id": "request-session",
     }
+
+
+@pytest.mark.asyncio
+async def test_session_chat_starts_process_watchers_registered_by_api_turn(
+    adapter, session_db, monkeypatch
+):
+    """API turns must hand terminal completion watchers to GatewayRunner."""
+    from tools.process_registry import process_registry
+
+    session_id = session_db.create_session("watcher-handoff", "api_server")
+    watcher = {
+        "session_id": "proc-api-handoff",
+        "check_interval": 0,
+        "platform": "api_server",
+        "chat_id": session_id,
+        "notify_on_complete": True,
+    }
+    started = asyncio.Event()
+    observed = []
+    runner = object.__new__(GatewayRunner)
+    runner._background_tasks = set()
+
+    async def fake_process_watcher(pending):
+        observed.append(pending)
+        started.set()
+
+    runner._run_process_watcher = fake_process_watcher
+    adapter.gateway_runner = runner
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        _last_compaction_in_place = False
+
+        def __init__(self):
+            self.session_id = session_id
+
+        def run_conversation(self, user_message, conversation_history, task_id):
+            process_registry.pending_watchers.append(watcher)
+            return {"final_response": "started"}
+
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+    process_registry.pending_watchers = []
+    try:
+        app = _create_session_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "start background work"},
+            )
+            assert response.status == 200
+            assert (await response.json())["message"]["content"] == "started"
+
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert observed == [watcher]
+        assert process_registry.pending_watchers == []
+    finally:
+        process_registry.pending_watchers = []
 
 
 @pytest.mark.asyncio
