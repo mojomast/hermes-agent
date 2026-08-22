@@ -3221,11 +3221,31 @@ def terminal_tool(
                         get_session_env as _gse,
                     )
 
-                    # Finite sessions (stateless HTTP requests and one-shot
-                    # Kanban workers) cannot route a completion back to the
-                    # agent after the turn/process ends. Refuse the promise:
-                    # drop the flags and tell the agent to poll.
-                    if not _async_ok():
+                    _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
+                    _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
+                    _delivery_ok = _async_ok()
+                    if (
+                        not _delivery_ok
+                        and _gw_platform == "api_server"
+                        and _gw_chat_id
+                    ):
+                        # The HTTP response itself is stateless, but a native
+                        # API session has a durable raw session id. The gateway
+                        # watcher can resume it through the existing self-post
+                        # wake path when this process exits.
+                        _delivery_ok = True
+                        logger.info(
+                            "background proc %s: api_server session %s is "
+                            "wakeable via self-post; keeping async notification",
+                            proc_session.id,
+                            _gw_chat_id,
+                        )
+
+                    # Truly finite sessions (session-id-less HTTP requests,
+                    # one-shot runners, cron, and Kanban workers) cannot route
+                    # a completion after the turn/process ends. Refuse the
+                    # promise: drop the flags and tell the agent to poll.
+                    if not _delivery_ok:
                         notify_on_complete = False
                         watch_patterns = None
                         result_data["notify_on_complete"] = False
@@ -3244,9 +3264,7 @@ def terminal_tool(
                             proc_session.id,
                         )
                     else:
-                        _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
                         if _gw_platform:
-                            _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
                             _gw_thread_id = _gse("HERMES_SESSION_THREAD_ID", "")
                             _gw_user_id = _gse("HERMES_SESSION_USER_ID", "")
                             _gw_user_name = _gse("HERMES_SESSION_USER_NAME", "")

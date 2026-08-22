@@ -1,11 +1,9 @@
 """Tests for the async-delivery capability gate (issue #10760).
 
-Stateless request/response adapters (the API server / WebUI path) cannot route
-a background completion back to the agent after a turn ends — there is no
-persistent channel and ``APIServerAdapter.send()`` is a no-op stub. So tools
-that promise async delivery (``terminal`` notify_on_complete / watch_patterns,
-``delegate_task`` background=True) must refuse the promise on that path instead
-of silently registering a watcher that never fires.
+Stateless request/response adapters do not have a persistent push channel.
+Native API sessions with a durable raw session id can still receive background
+completions through the gateway's authenticated self-post wake path. Truly
+one-shot API calls and finite runners must refuse async-delivery promises.
 
 This is wired through:
   - ``BasePlatformAdapter.supports_async_delivery`` (default True)
@@ -174,7 +172,7 @@ class TestAdapterCapabilityFlag:
 
 
 # ---------------------------------------------------------------------------
-# terminal_tool: refuses to register a watcher on unsupported sessions
+# terminal_tool: API sessions self-post; one-shot sessions refuse the promise
 # ---------------------------------------------------------------------------
 
 class TestTerminalNotifyGate:
@@ -193,11 +191,38 @@ class TestTerminalNotifyGate:
             terminal_tool(command=command, background=True, notify_on_complete=True)
         )
 
-    def test_api_server_skips_watcher_and_notes(self):
+    def test_api_server_session_registers_self_post_watcher(self):
         from tools.process_registry import process_registry
 
         tokens = set_session_vars(
-            platform="api_server", chat_id="s1", session_key="s1", async_delivery=False
+            platform="api_server",
+            chat_id="s1",
+            session_key="s1",
+            session_id="s1",
+            async_delivery=False,
+        )
+        try:
+            d = self._run_bg("sleep 30 && echo DONE")
+        finally:
+            clear_session_vars(tokens)
+
+        assert d.get("notify_on_complete") is True
+        assert "notify_unsupported" not in d
+        assert len(process_registry.pending_watchers) == 1
+        watcher = process_registry.pending_watchers[0]
+        assert watcher["platform"] == "api_server"
+        assert watcher["chat_id"] == "s1"
+        assert watcher["parent_session_id"] == "s1"
+
+    def test_api_server_without_session_id_skips_watcher_and_notes(self):
+        from tools.process_registry import process_registry
+
+        tokens = set_session_vars(
+            platform="api_server",
+            chat_id="",
+            session_key="",
+            session_id="",
+            async_delivery=False,
         )
         try:
             d = self._run_bg("sleep 30 && echo DONE")
@@ -208,5 +233,4 @@ class TestTerminalNotifyGate:
         assert d.get("notify_unsupported"), "must explain the limitation"
         assert "poll" in d["notify_unsupported"].lower()
         assert len(process_registry.pending_watchers) == 0
-
 

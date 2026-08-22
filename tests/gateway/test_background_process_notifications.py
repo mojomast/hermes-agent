@@ -116,6 +116,44 @@ class TestLoadBackgroundNotificationsMode:
 
 
 @pytest.mark.asyncio
+async def test_api_server_completion_carries_raw_wake_session_id(monkeypatch, tmp_path):
+    import tools.process_registry as pr_module
+
+    session = SimpleNamespace(
+        output_buffer="bot result\n",
+        exited=True,
+        exit_code=0,
+        command="hermes --profile auditbot chat -q review",
+        started_at=123.0,
+    )
+    monkeypatch.setattr(
+        pr_module, "process_registry", _FakeRegistry([session], consumed=False)
+    )
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "concise")
+    runner._enqueue_process_completion_notification = AsyncMock(return_value=True)
+    watcher = {
+        "session_id": "proc_profile_bot",
+        "session_key": "opaque-api-session-key",
+        "check_interval": 0,
+        "platform": "api_server",
+        "chat_id": "raw-parent-session-id",
+        "notify_on_complete": True,
+    }
+
+    await runner._run_process_watcher(watcher)
+
+    runner._enqueue_process_completion_notification.assert_awaited_once()
+    completion = runner._enqueue_process_completion_notification.await_args.args[1]
+    assert completion["origin_session_id"] == "raw-parent-session-id"
+    assert completion["platform"] == "api_server"
+
+
+@pytest.mark.asyncio
 async def test_consumed_completion_skips_raw_notification(monkeypatch, tmp_path):
     """#65379: after process(wait) already returned the completion inline,
     the gateway watcher must NOT also push the raw

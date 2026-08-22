@@ -25640,6 +25640,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "type": "completion",
                         "session_id": session_id,
                         "session_key": session_key,
+                        # api_server chat_id is the raw resumable session id.
+                        # Carry it explicitly so the self-post wake does not
+                        # depend on parsing an opaque session key.
+                        "origin_session_id": (
+                            chat_id if platform_name == "api_server" else ""
+                        ),
                         "platform": platform_name,
                         "chat_type": watcher.get("chat_type", ""),
                         "chat_id": chat_id,
