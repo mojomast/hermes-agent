@@ -1,0 +1,53 @@
+name: assetrizz
+title: Assetrizz
+repo: https://github.com/mojomast/assetrizz
+sha: "05339c228f55ac95ad21b5c947db0c6e36207cd4"
+subdir: plugin
+description: >-
+  Skill id assetrizz:assetrizz-composer. Search the assetrizz 2D game-asset
+  catalog (FTS over slugs, tags, descriptions, styles, and categories) and
+  compose scenes from those assets. Tools: assetrizz_search and assetrizz_scene.
+  Installs the plugin/ subdirectory only (a root install is refused so the
+  1.65 GB PNG tree is never copied into the plugins folder). A compressed
+  catalog (about 4.7 MB, SHA-256 pinned) is bundled so search works after
+  install. Asset mode is one of on_demand (default: fetch a single PNG from
+  GitHub raw when you place, render, or preview it), local (you download the
+  full library or chosen style packs once into a directory you pick), or
+  offline (local files only, no network). Bulk library downloads are
+  user-initiated only — use the Download library button in the Desktop pane
+  (size estimate, progress, cancel) or python -m assetrizz_plugin.cli; they
+  are not a model tool. Fetches go only to
+  raw.githubusercontent.com/mojomast/assetrizz/v0.1.0/assets/…, use the
+  Hermes SSRF guard, cap size, and verify SHA-256 from the catalog. Optional
+  library_path still prefers a complete checkout when you have one. Rendered
+  scenes write PNG and JSON under the plugin data directory and, if you set
+  it, the Export directory (must not be a filesystem root; never chosen by a
+  tool argument). No credentials, no subprocesses. Hermes Desktop 0.23 or
+  newer can show a dark compose pane that live-previews the current scene
+  through ctx.rest and lets you install or remove a local library (deletion
+  needs confirmation). The two tools still run when that pane is unavailable.
+maintainer: mojomast
+tier: community
+category: tools
+requires_hermes: ">=0.23.0"
+docs_url: https://github.com/mojomast/assetrizz/tree/v0.1.0/plugin#readme
+version: "0.1.0"
+image: https://raw.githubusercontent.com/mojomast/assetrizz/05339c228f55ac95ad21b5c947db0c6e36207cd4/docs/banner.jpg
+readme: true
+platforms: []
+known_issues:
+  - >-
+    Catalog CI does a full git clone of this repo (about 1.65 GB of PNGs)
+    with a 600s timeout. A user install of subdir plugin/ is a blobless
+    sparse checkout of plugin/ only, so everyday installs stay small.
+  - >-
+    The Desktop compose pane has not yet been proven on a live Hermes
+    Desktop host; the two tools and the mocked pane API tests still run
+    without it.
+capabilities:
+  provides_tools:
+    - assetrizz_search
+    - assetrizz_scene
+  provides_hooks: []
+  provides_middleware: []
+  requires_env: []
