@@ -3,7 +3,36 @@ title: Stitch Slop
 repo: https://github.com/mojomast/hermes-stitchslop
 sha: 51c12d0fd957fb4f40f98253570eb33d791c314c
 subdir: ""
-description: "Work on the embroidery design open in Stitch Slop, watch it in a pane, and digitize artwork into machine stitch files. Ships the bridge its tab dials into (loopback WebSocket, protocol 1 of stitchslop.com/agent), a viewer page that streams a dedicated Chrome window and forwards clicks and keys, four tools, an arc-typesetting and art-prep script, and a bundled skill covering the digitizing workflow. Disclosure — writes ~/.stitchslop (pairing, Chrome profile, exports, logs), shared by every Hermes profile on the machine; starts a loopback WebSocket bridge, a token-gated viewer server and a dedicated Chrome (launched with --no-sandbox and Local Network Access checks off) on a private X display; the viewer binds to loopback only unless you set STITCHSLOP_PANE_BIND to a Tailscale address, which exposes the token-gated viewer (live view and click/key control of that Chrome, logged into your Stitch Slop account) to your tailnet; navigation is limited to https://stitchslop.com; first pairing needs you to paste the Agent-panel token by hand."
+description: >-
+  Stitch Slop for Hermes: drive the Stitch Slop embroidery editor from chat,
+  watch it live in a pane, and digitize artwork into DST or PES machine stitch
+  files. The plugin ships the bridge the Stitch Slop tab dials into (loopback
+  WebSocket, protocol 1 of stitchslop.com/agent) and a viewer page that streams
+  a dedicated Chrome window into the pane and forwards your clicks and keys, so
+  you can take over mid-design. Four tools: stitchslop_status (bridge, tab,
+  Chrome and pane health in one call), stitchslop_connect (start the bridge and
+  wait for the tab), stitchslop_call (run one of the app's 80+ verbs, such as
+  scene.describe, background.digitize or design.export; x.list returns them all)
+  and stitchslop_browser (start or stop the pane). A bundled skill covers art
+  prep, tracing, stitch treatments, lettering on an arc and verification, with
+  an arc-typesetting script and an art-prep script (optional Pillow and NumPy).
+  It is for embroiderers who want an agent to turn a logo or badge into a
+  stitchable design, set text around a ring, and export files for their machine.
+  To start, on Linux with Hermes 0.21.6 or newer run hermes plugins install
+  stitchslop and hermes plugins enable stitchslop. Pair once by hand: in Stitch
+  Slop open Agent, switch on Enable Agent Connections and copy the token, paste
+  it yourself into a 0600 token file, and start the bridge once with
+  --token-file (the README has the steps). Then call stitchslop_connect with no
+  token, and stitchslop_browser to open the pane. Disclosure — writes
+  ~/.stitchslop (pairing, Chrome profile, exports, logs), shared by every Hermes
+  profile on the machine; starts a loopback WebSocket bridge, a token-gated
+  viewer server and a dedicated Chrome (launched with --no-sandbox and Local
+  Network Access checks off) on a private X display. Disclosure — the viewer
+  binds to loopback only unless you set STITCHSLOP_PANE_BIND to a Tailscale
+  address, which exposes the token-gated viewer (live view and click/key control
+  of that Chrome, logged into your Stitch Slop account) to your tailnet;
+  navigation is limited to https://stitchslop.com; first pairing needs you to
+  paste the Agent-panel token by hand.
 maintainer: mojomast
 tier: community
 category: tools
