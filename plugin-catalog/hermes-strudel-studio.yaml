@@ -4,17 +4,35 @@ repo: https://github.com/mojomast/poptart
 sha: 42356ddb9eff2eea2419bbd223ee159f353e4632
 subdir: integration/hermes
 description: >-
-  Local Strudel live-coding studio for Hermes: write patterns, hit Play, and
-  let the agent compose alongside you with one poptart_studio tool and a
-  Desktop SandboxedFrame pane. Disclosure — lazily starts a Node sidecar on
-  127.0.0.1 with a random per-install token in private profile plugin-data
-  (mode 0600 on POSIX; inherited user-private ACL on Windows; token never
-  reaches guests or the browser); evaluated music
-  runs only after user Play/apply in isolated frames (not an OS sandbox);
-  Strudel patterns may fetch samples/CDN over the network; audio output to
-  the host. AGPL-3.0-or-later with toaster GPL notices — review LICENSE and
-  NOTICE before redistribute. Self-contained catalog install; Node 22+ is
-  required at runtime, not npm or a local build. No self-updater.
+  poptart: a local Strudel live-coding studio for Hermes. Write music as code,
+  press Play, and let the agent compose alongside you in a docked pane. The
+  studio has a pattern editor with a tempo field and Play / apply, Stop and
+  Mute; tokens light up as they play; and an invalid edit keeps the last good
+  pattern playing while the error is shown. Tracks persist in a library with
+  revision numbers, snapshots and named sections (for example Intro, Main,
+  Break). Sounds are bundled for offline use (three small CC0 samples plus
+  Strudel synths), and the pane follows your Hermes theme. The agent works
+  through one poptart_studio tool (a 127-token schema) with 11 ops: list, get,
+  create, update, update_section, sections, snapshot, snapshots, restore,
+  analyze and export (code only). Writes are revision-checked, so a CONFLICT
+  tells the agent to re-read and keep your edits. Agent edits persist but never
+  auto-play, and there is no delete, shell, remote-playback or audio-export op.
+  It is for live coders and musicians who want an agent to draft a beat, add a
+  break or change the tempo while they stay at the controls. To start, run
+  hermes plugins install hermes-strudel-studio --enable (Hermes 0.22.7 or newer,
+  and Node 22 or newer at runtime; no npm or local build). The Desktop pane
+  ships switched off: turn it on under Capabilities → Plugins → Strudel Studio →
+  Desktop, then Rescan. Ask Hermes to create a track, then press Play / apply in
+  the pane; browsers need that click before audio can start. Disclosure — local
+  service: lazily starts a Node sidecar on 127.0.0.1 with a random per-install
+  token in private profile plugin-data (mode 0600 on POSIX; inherited
+  user-private ACL on Windows); the token never reaches guests or the browser.
+  No self-updater. Disclosure — code and network: evaluated music runs only
+  after user Play/apply in isolated frames, which are not an OS sandbox, so
+  review untrusted patterns before you play them. Strudel patterns may fetch
+  samples or CDN resources over the network. Audio plays on the host. Disclosure
+  — license: AGPL-3.0-or-later with toaster GPL notices; review LICENSE and
+  NOTICE before you redistribute.
 maintainer: mojomast
 tier: community
 category: desktop
